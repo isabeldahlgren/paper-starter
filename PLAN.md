@@ -1,0 +1,114 @@
+# proof-engineering — Implementation Plan
+
+An autonomous research engine for pure mathematics. Input: papers from the user's research field. It executes `PROMPT.md` against each paper, iterates, and only interrupts the user when a result has independently passed **both** a taste gate and a correctness gate. Optimize for quality of output, not volume. A yield of one reviewable result per ~10 papers is success.
+
+This document is the spec. Implement it exactly; where it is silent, choose the simplest option.
+
+## Design principles
+
+1. **Filesystem is the database.** No server, no queue system. Each paper gets a run directory; a `state.json` records the stage. The orchestrator is resumable and idempotent: re-running it continues unfinished runs.
+2. **Prompts are files.** Every stage is a markdown prompt file in `prompts/`, executed via headless Claude Code (`claude -p "$(cat prompts/X.md)" ...`). Tuning the system means editing prompts, not code.
+3. **Verifier independence.** Referees run in fresh contexts, never see the generator's reasoning or confidence — only the finished note. Adversarial framing: the referee's job is to *find the error*, not to confirm.
+4. **Honest claim labels.** Every claim is tagged: `theorem-complete-proof` | `theorem-sketch` | `conjecture-with-evidence` | `computation` | `speculation`. Only `theorem-complete-proof` items enter the correctness gate as theorems; a note may still pass overall on the strength of a well-evidenced conjecture, but the labels must survive refereeing.
+5. **The user's time is the scarcest resource.** False positives (bad results reaching review) are 10x worse than false negatives (good results archived). All thresholds err toward rejection. Every rejection is archived with reasons so the pipeline is auditable.
+
+## Directory layout
+
+```
+proof-engineering/
+  PROMPT.md              # the research brief (exists)
+  PLAN.md                # this file
+  orchestrate.py         # single orchestrator script
+  config.toml            # models, budgets, thresholds, referee backend
+  prompts/
+    explore.md           # stage 2: wraps PROMPT.md with output-format contract
+    self_check.md        # stage 3: generator-side adversarial pass + counterexample search
+    novelty.md           # stage 4a: prior-art search (arXiv/web)
+    taste_referee.md     # stage 4b: independent taste/relevance scoring
+    correctness_referee.md  # stage 5a: independent line-by-line refereeing
+    lean_formalize.md    # stage 5b: Lean 4 statement/proof formalization
+  taste/
+    accepted/            # user-approved results (few-shot calibration for taste gate)
+    rejected/            # user-rejected results, with her stated reason
+  inbox/                 # user drops PDFs / arXiv IDs (one .txt with ID per line) here
+  runs/<paper-slug>/
+    paper/               # source (prefer arXiv LaTeX over PDF text extraction)
+    state.json           # {stage, attempts, timestamps, verdicts}
+    note.typ             # the research note (Typst, unequivocal-ams template, abstract + upfront main result + novelty statement)
+    result.json          # structured claims with labels, statements, proof status
+    referee/             # taste + correctness reports, novelty search log
+    lean/                # Lake project for formalization attempts
+  review/<paper-slug>/   # symlink or copy of runs that passed both gates
+  archive/<paper-slug>/  # everything else, with rejection.md stating why
+```
+
+## Pipeline stages
+
+### 1. Intake
+Watch `inbox/`. For each PDF or arXiv ID: create `runs/<slug>/`, fetch the paper (for arXiv IDs, download the LaTeX source — far better than PDF extraction; fall back to `pdftotext`), write `state.json` with `stage: explore`. Move the inbox item into the run.
+
+### 2. Explore (generator)
+Execute `prompts/explore.md`, which embeds `PROMPT.md` verbatim and adds the output contract: produce `note.typ` (Typst, `unequivocal-ams` template — AMS-article style, one line per paragraph, brief abstract, main result(s) stated clearly up front, an explicit paragraph on what is novel relative to the source paper) and `result.json` listing every claim with its label, precise statement, and proof status. The generator may use Python/SymPy/Sage for computations and must include source code for any experiment in the run directory. Bounded: max 5 conjecture-repair iterations, then write up the strongest correct statement reached.
+
+### 3. Self-check (cheap kill)
+Fresh context, same or cheaper model. Two jobs: (a) adversarially re-derive each `theorem-complete-proof` claim and hunt for gaps; (b) **counterexample search** — for every universally quantified claim that admits finite/computable instances, write and run code testing small cases. A single counterexample kills the claim; the run loops back to stage 2 once (with the counterexample as feedback), then archives if it fails again. This is the highest-value check per dollar: numerics beat second opinions.
+
+### 4. Taste gate
+- **4a Novelty:** search arXiv and the web for each surviving main claim. If the result is known, archive as `rejected: known` (log the reference — still useful to the user as reading, but not review-worthy).
+- **4b Taste referee:** independent model, fresh context, sees only the paper + the note. Scores 1–5 on: relevance to the source paper, depth (does it need a real idea, or is it a one-line corollary of a standard theorem?), naturality of the question, and strength of the statement. Include the contents of `taste/accepted/` and `taste/rejected/` as few-shot calibration — **this is how the system learns the user's taste over time.** Pass requires ≥4 on depth and no score below 3. Explicit referee question: "Would a strong journal referee call this a routine exercise?"
+
+### 5. Correctness gate (both tracks run; track A is mandatory)
+- **5a LLM referee:** strongest available model (configurable; ideally a different provider than the generator — set in `config.toml`). Fresh context, sees only `note.typ` + `result.json`. Produces a line-by-line referee report; verdict per claim: `correct` / `fixable-gap` / `wrong` / `cannot-verify`. Require **two independent passes** (different seeds/contexts) both returning `correct` on every load-bearing claim. `fixable-gap` loops back to stage 2 once; anything else archives.
+- **5b Lean track (bonus evidence, not a blocker):** attempt Lean 4 formalization via the `aristotle` CLI (Harmonic's cloud autoformalization service — `aristotle formalize <file> --wait --destination <dir>`), not a self-hosted Mathlib build. Always attempt **statement-level** formalization first: a statement that typechecks catches quantifier and type errors cheaply. Attempt full proofs only for self-contained, elementary-enough claims; respect `lean_timeout_minutes` per claim. Record outcome in `result.json`: `statement-formalized` / `proof-formalized` / `not-formalizable`. A `proof-formalized` claim is marked ✓✓ in the review summary. Requires `ARISTOTLE_API_KEY` in the environment.
+
+### 6. Review handoff
+Runs passing gates 4 and 5a land in `review/<slug>/` containing: `SUMMARY.md` (one page: the statement, why it's interesting in one paragraph, verification evidence table, links to referee reports and Lean files), `note.typ` compiled to PDF (`typst compile` must succeed — treat as a lint), and all supporting code. Notify the user (macOS `osascript` notification or a daily digest file; keep it simple). **After the user reviews:** she moves the result's summary into `taste/accepted/` or `taste/rejected/` with a one-line reason — closing the taste feedback loop.
+
+## Orchestrator (`orchestrate.py`)
+
+Single Python file, stdlib only. Responsibilities: scan `inbox/` and `runs/`, advance each run one stage per invocation via `subprocess` calls to `claude -p` (with `--permission-mode` and `--allowedTools` scoped per stage — referees get read-only + web; only explore/lean stages get write/execute), enforce budgets, write `state.json` after every transition. Run it under `cron` or a `/loop`; it must be safe to invoke concurrently (lock file per run).
+
+`config.toml` keys: `generator_model`, `self_check_model`, `taste_model`, `referee_model` (+ optional `referee_command` to plug in a non-Claude CLI for cross-provider refereeing), `max_runs_per_day`, `max_usd_per_run`, `lean_timeout_minutes`, thresholds.
+
+## Milestones (implement in order; each is shippable)
+
+1. **M1 — Straight-through pipeline.** Intake → explore → self-check → archive/review, single paper, manual trigger, no gates beyond self-check. Verify the LaTeX note compiles and `result.json` validates against a schema.
+2. **M2 — The gates.** Novelty search, taste referee with few-shot calibration hooks, double-pass correctness referee, rejection archiving with reasons. This is the heart of the system; spend the most care on the two referee prompts.
+3. **M3 — Lean track.** Pinned Mathlib project template, statement-level formalization, `lake build` as the check, timeouts.
+4. **M4 — Autonomy.** Inbox watching, cron/loop scheduling, budget enforcement, notifications, and the `taste/` feedback loop.
+
+## Known weaknesses (do not paper over these)
+
+- **LLM referees share failure modes with LLM generators.** Two models agreeing is much weaker evidence than one counterexample search or one Lean proof. That is why stage 3 runs code and stage 5b exists. Never present LLM-only verification as more than "survived independent refereeing".
+- **Research-level formalization is usually out of reach.** Expect `not-formalizable` to be the common Lean outcome on genuinely interesting results; that is fine — the statement-level check still catches real errors.
+- **Taste is the weakest gate on day one.** It becomes good only through the `taste/` corpus. Early on, expect the user to reject reviewable results; every rejection with a reason makes the gate stronger.
+
+## Current status (updated 2026-07-07)
+
+**M1 (straight-through pipeline) is built and validated on real content.** `arxiv-2505.11846` (a CNN-identifiability paper) went end-to-end through explore → self_check and produced a genuinely good result: a closed-form fiber-size formula that turns out to be Sperner's antichain bound, connecting the source paper's open "how singular" question to classical combinatorics. Self-check caught two real exposition gaps without treating them as errors and correctly left one claim `conjecture-with-evidence`/`unchecked` with a precise explanation. That run currently sits in `runs/arxiv-2505.11846/` reset to `stage: explore, attempts: 0` (paper source cached under `paper/`, no need to refetch) — its own note/result.json were cleared when the output format changed and it has not been re-run since.
+
+**M2 (novelty + taste + correctness gates) is built but has never completed a real end-to-end run.** Pipeline order is now `explore → self_check → novelty → taste → correctness (2 blind passes) → review/archive`. Referee isolation is real, not just prompted: `make_referee_dir()` copies only the allowed files (paper + note.typ + a stripped result.json with `proof_status`/`self_check_notes` removed) into a subdirectory and runs `claude -p` with that as `cwd` and no `--add-dir`, so referees cannot read self-check reports, prior referee passes, or each other — confirmed with a dummy-data smoke test (no LLM cost). `taste/accepted/` and `taste/rejected/` (the few-shot calibration corpus, see `build_taste_calibration()`) are still empty by the user's choice; the taste gate currently judges by the stated rubric alone.
+
+**Output format: Typst + `unequivocal-ams`** (not LaTeX — LaTeX/amsart was tried per user request, then explicitly reverted back to Typst with this specific template). Real package source was pulled from the local Typst cache (`~/Library/Caches/typst/packages/preview/unequivocal-ams/0.1.2/lib.typ`): it only exports `ams-article`, `theorem`, `proof` — no `lemma`/`corollary`/`definition`, so `prompts/explore.md` shows the model the exact snippet to define those itself (same `kind: "theorem"`, sharing one AMS-style counter). Verified locally with a hand-written smoke test (`Theorem 1.1, Lemma 1.2, Corollary 1.3` numbered correctly, clean compile). The note must include: brief abstract, main result(s) stated within the first half page, and an explicit "what this note adds vs. the source paper" paragraph — all per direct user feedback, not in the original spec below.
+
+**Known-fixed bug: models were backgrounding long computations and ending their turn early**, e.g. "I'll wait for the background computation to finish rather than poll it." Since each stage is a single one-shot `claude -p` invocation with no future turn, this silently lost all output (no `note.typ`/`result.json` ever written). Fixed by adding explicit "never background — no `&`, `nohup`, and do not use your Bash tool's `run_in_background` option" instructions to `prompts/explore.md` and `prompts/self_check.md` (the only two stages with Bash access). Not yet re-validated end-to-end after this fix.
+
+**Token/session cost (2026-07-07: mitigated in code; billing choice still the operator's).** `claude -p` with no `ANTHROPIC_API_KEY` authenticates via the operator's Claude subscription (OAuth) and shares its session-based rate limit with interactive usage. Observed on a real run (`arxiv-2408.17221`): a single `explore` attempt cost $2.25, ran 18 turns/700s, read 1.6M cached tokens, then hit `api_error_status: 429` "session limit"; the instant retry burned the last attempt and the run archived without ever reaching `self_check`. What changed on 2026-07-07:
+- **429/session-limit/overload responses are now treated as transient** (`is_transient_failure`/`defer_stage`): the run pauses at its current stage with no attempt consumed and retries on a later orchestrator invocation. The failure mode that killed `arxiv-2408.17221` (archiving a run because of a rate limit) is gone.
+- **Referee-stage operational failures retry instead of archiving** (`referee_stage_error`, `max_referee_attempts`), and a `verdict.json` that omits a required claim or garbles a verdict value is a stage error, never a silent pass (previously an empty correctness verdict would have sailed a run into `review/` — a direct violation of design principle 5).
+- **Intake prunes harder**: beyond figures/`.sty`/`.bib`, it now strips `.bbl`/aux/build residue and full-line TeX comments before the first LLM call, directly attacking the 1.6M-cached-token reads.
+- **Pipeline calls are isolated from the operator's Claude Code config**: `claude_extra_args` defaults to `--strict-mcp-config` (personal MCP servers no longer load into — or leak into — every stage call); `--bare` is the documented full-isolation option (requires `ANTHROPIC_API_KEY`; OAuth is not read in bare mode).
+- Per-stage estimated cost on `sonnet`: explore $2-6, self_check ~$2, novelty $1-3, taste $1-2, correctness×2 $2-4 → ~$8-17/paper. For unattended operation the README recommends API-key billing; subscription use still works but the pipeline and interactive usage starve each other.
+
+**M4 (autonomy) is now mostly in place:** inbox watching with `max_runs_per_day` enforced at intake (surplus IDs stay queued in the inbox `.txt`), stale-lock recovery (a crashed orchestrator no longer blocks a run forever), a mechanical `SUMMARY.md` written on review handoff, and a macOS notification (`notify` in config). `finalize()` now *moves* runs out of `runs/` (in-flight only) instead of copying. Cron scheduling is the operator's (one `orchestrate.py` invocation per tick).
+
+**Not started: M3 (Aristotle/Lean formalization track).** Both `codex` (`codex-cli 0.142.5`, Homebrew) and `aristotle` (`uv tool install aristotlelib`) CLIs are installed and confirmed working (`aristotle formalize <file> --wait --destination <dir>`), but neither is wired into `orchestrate.py` yet. `config.toml`'s `referee_command = "codex exec"` is a documented-but-unused hook for cross-provider correctness refereeing if sonnet-vs-sonnet independence turns out to be too weak (not yet assessed, since no correctness-gate run has completed). **Also still true: no run has completed the full gate sequence end-to-end** — the next real validation step is draining one paper through novelty → taste → correctness on API billing.
+
+## Sources
+
+- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — single-file-edit, fixed-time-budget research loop; the minimalism this plan's orchestrator borrows.
+- [ZIB-IOL/The-Agentic-Researcher](https://github.com/ZIB-IOL/The-Agentic-Researcher) — sandboxed multi-agent research framework with `INSTRUCTIONS.md`-driven governance; source of the run-tracking-file pattern (`state.json` here).
+- [LeanConjecturer: Automatic Generation of Mathematical Conjectures for Theorem Proving](https://arxiv.org/html/2506.22005v1) — LLM + rule-based pipeline generating Lean 4 conjectures from Mathlib; motivates statement-level formalization as a cheap, high-yield check.
+- [LeanMarathon: Toward Reliable AI Co-Mathematicians through Long-Horizon Lean Autoformalization](https://arxiv.org/html/2606.05400v1) — long-horizon autoformalization tested on Erdős problems; evidence that full-proof formalization is often out of reach but partial formalization is tractable.
+- [Automated Conjecture Resolution with Formal Verification](https://frenzymath.com/blog/conjecture/) — generator/symbolic-refinement/Lean-certification pipeline; model for the self-check stage's use of symbolic computation before LLM refereeing.
+- [Discovering New Theorems via LLMs with In-Context Proof Learning in Lean](https://arxiv.org/pdf/2509.14274) — in-context proof learning in Lean; background for the Lean track's design.

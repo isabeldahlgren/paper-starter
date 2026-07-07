@@ -1,0 +1,19 @@
+# local run data — never publish research runs or personal paper queues
+runs/
+review/
+archive/
+inbox/*
+!inbox/.gitkeep
+
+# personal taste calibration corpus (ships empty; yours is yours)
+taste/accepted/*
+taste/rejected/*
+!taste/accepted/.gitkeep
+!taste/rejected/.gitkeep
+
+# environment / tooling
+.venv/
+__pycache__/
+*.pyc
+.claude/settings.local.json
+.DS_Store

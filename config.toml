@@ -1,0 +1,25 @@
+generator_model = "sonnet"
+self_check_model = "sonnet"
+taste_model = "sonnet"             # independent fresh-context taste referee (also runs the novelty search)
+referee_model = "sonnet"           # independent fresh-context correctness referee (two passes)
+referee_command = "codex exec"     # not wired in yet; available if sonnet-vs-sonnet independence proves too weak
+
+max_runs_per_day = 5               # intake quota; extra inbox items stay queued for tomorrow
+max_usd_per_run = 10.0             # hard cap per claude -p invocation, via --max-budget-usd
+                                   # calibrated from a real M1 run: explore cost $5.42, self_check $2.11
+max_explore_attempts = 2
+max_self_check_attempts = 2
+max_referee_attempts = 2           # operational retries per referee stage (invocation errors / malformed verdicts, not rejections)
+stage_timeout_seconds = 1800       # wall-clock limit per claude -p invocation
+
+# Extra flags passed to every `claude -p` invocation.
+# --strict-mcp-config keeps your personal MCP servers (and their token cost)
+# out of pipeline calls. Add "--bare" for full isolation from your global
+# Claude Code config (hooks, CLAUDE.md auto-discovery, plugins) — recommended
+# for unattended operation, but note --bare authenticates ONLY via
+# ANTHROPIC_API_KEY (subscription OAuth is never read in bare mode).
+claude_extra_args = ["--strict-mcp-config"]
+
+notify = true                      # macOS notification when a run lands in review/
+lean_timeout_minutes = 30          # unused until M3 (aristotle formalize)
+venv_python = ".venv/bin/python3"
