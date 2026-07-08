@@ -366,7 +366,7 @@ def make_referee_dir(run_dir, name, include_paper):
     dest.mkdir()
     if include_paper:
         shutil.copytree(run_dir / "paper", dest / "paper")
-    shutil.copy(run_dir / "note.typ", dest / "note.typ")
+    shutil.copy(run_dir / "note.tex", dest / "note.tex")
     strip_result_for_referee(run_dir / "result.json", dest / "result.json")
     return dest
 
@@ -385,13 +385,18 @@ def build_taste_calibration():
 
 # --- validation --------------------------------------------------------------
 
-def compile_typst(run_dir):
+def compile_latex(run_dir):
     proc = subprocess.run(
-        ["typst", "compile", "note.typ", "note.pdf"],
+        ["latexmk", "-pdf", "-interaction=nonstopmode", "-halt-on-error", "note.tex"],
         cwd=run_dir, capture_output=True, text=True, timeout=120,
     )
-    if proc.returncode != 0 or not (run_dir / "note.pdf").exists():
-        return False, proc.stderr
+    ok = proc.returncode == 0 and (run_dir / "note.pdf").exists()
+    for ext in ("aux", "log", "out", "fls", "fdb_latexmk", "bbl", "blg", "toc"):
+        f = run_dir / f"note.{ext}"
+        if f.exists():
+            f.unlink()
+    if not ok:
+        return False, proc.stdout + proc.stderr
     return True, None
 
 
@@ -507,12 +512,12 @@ def do_explore(run_dir, state, cfg):
     if not ok:
         return fail_or_archive(run_dir, state, "explore", f"claude invocation failed:\n{log}", cfg)
 
-    if not (run_dir / "note.typ").exists() or not (run_dir / "result.json").exists():
-        return fail_or_archive(run_dir, state, "explore", "Model did not produce both note.typ and result.json.", cfg)
+    if not (run_dir / "note.tex").exists() or not (run_dir / "result.json").exists():
+        return fail_or_archive(run_dir, state, "explore", "Model did not produce both note.tex and result.json.", cfg)
 
-    compile_ok, compile_err = compile_typst(run_dir)
+    compile_ok, compile_err = compile_latex(run_dir)
     if not compile_ok:
-        return fail_or_archive(run_dir, state, "explore", f"typst compile failed:\n{compile_err}", cfg)
+        return fail_or_archive(run_dir, state, "explore", f"latex compile failed:\n{compile_err}", cfg)
 
     valid, err = validate_result_json(run_dir / "result.json")
     if not valid:
@@ -520,7 +525,7 @@ def do_explore(run_dir, state, cfg):
 
     state["stage"] = "self_check"
     state["feedback"] = None
-    append_history(state, "explore", "passed lint (typst compiles, result.json valid)")
+    append_history(state, "explore", "passed lint (latex compiles, result.json valid)")
     save_state(run_dir, state)
     return True
 
@@ -856,7 +861,7 @@ def list_run_dirs():
 
 
 def preflight():
-    missing = [tool for tool in ("claude", "typst") if shutil.which(tool) is None]
+    missing = [tool for tool in ("claude", "latexmk") if shutil.which(tool) is None]
     if missing:
         raise SystemExit(f"missing required tool(s) on PATH: {', '.join(missing)} — see README.md for setup")
     if not os.environ.get("ANTHROPIC_API_KEY"):

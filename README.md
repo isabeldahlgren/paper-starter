@@ -1,6 +1,6 @@
 # proof-engineering
 
-An autonomous research pipeline for pure mathematics. You drop papers into an inbox; it reads each one as a research collaborator, finds a follow-up question, works it out (proof, counterexample search, computation), writes a short research note in Typst — and only shows you results that independently pass a **taste gate** and a **correctness gate**.
+An autonomous research pipeline for pure mathematics. You drop papers into an inbox; it reads each one as a research collaborator, finds a follow-up question, works it out (proof, counterexample search, computation), writes a short research note in LaTeX — and only shows you results that independently pass a **taste gate** and a **correctness gate**.
 
 It optimizes for quality over volume. A yield of **one reviewable result per ~10 papers is success**; everything else is archived with an explicit rejection reason so the pipeline stays auditable. False positives (bad results reaching you) are treated as 10× worse than false negatives (good results archived), and every threshold errs toward rejection.
 
@@ -15,7 +15,7 @@ inbox/ ──► explore ──► self_check ──► novelty ──► taste 
                                  loop back once                                  else, with reasons)
 ```
 
-- **explore** (generator): reads the paper, finds one or two natural follow-up questions, works them seriously (with Python/SymPy for experiments), and writes `note.typ` + `result.json`. Every claim gets an honest label: `theorem-complete-proof`, `theorem-sketch`, `conjecture-with-evidence`, `computation`, or `speculation`.
+- **explore** (generator): reads the paper, finds one or two natural follow-up questions, works them seriously (with Python/SymPy for experiments), and writes `note.tex` + `result.json`. Every claim gets an honest label: `theorem-complete-proof`, `theorem-sketch`, `conjecture-with-evidence`, `computation`, or `speculation`.
 - **self_check** (cheap kill): a fresh context adversarially re-derives every claimed proof and runs a **computational counterexample search** on small cases. Numerics beat second opinions — this is the highest-value check per dollar.
 - **novelty**: searches arXiv and the web; anything already known is archived with the reference.
 - **taste**: an independent referee scores relevance, depth, naturality, and strength against a rubric — calibrated over time by your own accept/reject decisions (see below).
@@ -27,7 +27,7 @@ Everything is files: no server, no queue. `orchestrate.py` is a single stdlib-on
 ## Requirements
 
 - [Claude Code](https://claude.com/claude-code) CLI (`claude`) on your PATH
-- [Typst](https://typst.app) (`typst`) — used to compile and lint every note
+- A LaTeX distribution providing `latexmk` and `pdflatex` (e.g. [TeX Live](https://tug.org/texlive/) or MacTeX) — used to compile and lint every note
 - Python **3.12+** (the orchestrator itself is stdlib-only)
 - Optional: `pdftotext` (`brew install poppler`) — only needed for PDF intake; arXiv IDs use LaTeX source directly and don't need it
 - A venv for the generator's experiments: `python3 -m venv .venv && .venv/bin/pip install sympy mpmath`
@@ -116,7 +116,7 @@ orchestrate.py    the entire orchestrator (stdlib only)
 config.toml       models, budgets, retries
 prompts/          one markdown prompt per stage
 inbox/            drop PDFs or a .txt of arXiv IDs here
-runs/<slug>/      in-flight runs (state.json, note.typ, result.json, referee/)
+runs/<slug>/      in-flight runs (state.json, note.tex, result.json, referee/)
 review/<slug>/    passed both gates — SUMMARY.md, note.pdf, referee reports
 archive/<slug>/   rejected, each with rejection.md stating why
 taste/            your accept/reject calibration corpus

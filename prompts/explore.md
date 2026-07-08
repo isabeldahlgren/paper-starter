@@ -4,39 +4,39 @@ You are working in the current directory, which is a run directory for one paper
 
 Follow the research brief above exactly. When you are done, before finishing, you must have written exactly these two files in the current directory:
 
-1. `note.typ` — the research note, in Typst, using the `unequivocal-ams` package (AMS-article style). One paragraph per line (no wrapped paragraphs across multiple lines). **Exposition quality is the top priority** — this matters as much as correctness. Concretely:
+1. `note.tex` — the research note, in LaTeX, using the `amsart` document class. One paragraph per line (no wrapped paragraphs across multiple lines). **Exposition quality is the top priority** — this matters as much as correctness. Follow standard conventions for good mathematical writing: *italics* (`\emph{}`) for terms at the point they are defined, inline math (`$...$`) for symbols and short expressions embedded in prose, and reserve displayed/numbered equations for results worth setting apart. Concretely:
    - Include a brief abstract stating the question and the answer.
+   - Give the note a concise, specific title — a title should be a phrase, not a sentence-length summary of the results; if you are tempted to write "and its consequence for..." or similar, shorten it.
    - State the main result(s) clearly and prominently near the beginning, right after the introduction — a reader should know exactly what was proved within the first half page, not have to hunt for it after pages of setup.
    - Include an explicit paragraph (in the introduction) making clear what this note *adds* relative to the source paper: which question it answers that the paper leaves open, which of its results are used as a black box vs. re-derived, and what is genuinely new here. Do not let this novelty statement be implicit or scattered — state it directly.
    - Structure: abstract, introduction (motivation + main result + novelty statement), definitions, examples, precise statements, proofs, open questions, references.
-   - It must compile standalone: run `typst compile note.typ note.pdf` yourself before finishing and fix any compiler errors.
+   - It must compile standalone: run `latexmk -pdf note.tex` yourself before finishing and fix any compiler errors.
 
    Start the file exactly like this:
-   ```typ
-   #import "@preview/unequivocal-ams:0.1.2": ams-article, theorem, proof
-
-   #show: ams-article.with(
-     title: [Your title],
-     authors: ((name: "proof-engineering"),),
-     abstract: [Your brief abstract.],
-   )
+   ```tex
+   \documentclass{amsart}
+   \usepackage{amsmath,amssymb,amsthm}
+   \theoremstyle{plain}
+   \newtheorem{theorem}{Theorem}[section]
+   \newtheorem{lemma}[theorem]{Lemma}
+   \newtheorem{proposition}[theorem]{Proposition}
+   \newtheorem{corollary}[theorem]{Corollary}
+   \newtheorem{conjecture}[theorem]{Conjecture}
+   \theoremstyle{definition}
+   \newtheorem{definition}[theorem]{Definition}
+   \newtheorem{example}[theorem]{Example}
+   \theoremstyle{remark}
+   \newtheorem{remark}[theorem]{Remark}
+   \title{Your title}
+   \author{Proof Engineer}
+   \date{}
+   \begin{document}
+   \begin{abstract}
+   Your brief abstract.
+   \end{abstract}
+   \maketitle
    ```
-   The package only exports `theorem` and `proof` (both styled, numbered). It does *not* export `lemma`, `corollary`, `definition`, `proposition`, or `remark` — if you need those (you almost always will), define them yourself by mirroring the package's own `theorem` function, e.g.:
-   ```typ
-   #let lemma(body, numbered: true) = figure(
-     body, kind: "theorem", supplement: [Lemma],
-     numbering: if numbered { n => counter(heading).display() + [#n] },
-   )
-   #let corollary(body, numbered: true) = figure(
-     body, kind: "theorem", supplement: [Corollary],
-     numbering: if numbered { n => counter(heading).display() + [#n] },
-   )
-   #let definition(body, numbered: true) = figure(
-     body, kind: "theorem", supplement: [Definition],
-     numbering: if numbered { n => counter(heading).display() + [#n] },
-   )
-   ```
-   (same `kind: "theorem"` on purpose — they share one running counter per section, which is standard AMS numbering: "Theorem 2.1, Lemma 2.2, Corollary 2.3"). A plain, non-machine-managed "References" section (a heading plus a formatted list of citations) is perfectly acceptable — you do not need to build a working `.bib` file.
+   All theorem-like environments share one running counter per section on purpose — this is standard AMS numbering: "Theorem 2.1, Lemma 2.2, Corollary 2.3". Add further environments (e.g. `speculation`) the same way if you need them. Use `\label{}`/`\ref{}` for cross-references, never hardcoded numbers. A plain, non-machine-managed "References" section via `\begin{thebibliography}{9}...\end{thebibliography}` with manual `\bibitem`/`\cite` keys is perfectly acceptable — you do not need to build a working `.bib` file. End the file with `\end{document}`.
 
 2. `result.json` — a machine-readable index of every claim in the note, in this exact schema:
 
@@ -55,7 +55,7 @@ Follow the research brief above exactly. When you are done, before finishing, yo
 ```
 
 Rules for `result.json`:
-- Every claim in `note.typ` that is stated as a theorem, proposition, conjecture, or computed fact must appear here with a matching `id` referenced in the note (e.g. a label you can cross-reference).
+- Every claim in `note.tex` that is stated as a theorem, proposition, conjecture, or computed fact must appear here with a matching `id` referenced in the note (e.g. a `\label` you can cross-reference).
 - `label` must be honest. `theorem-complete-proof` means you have actually verified every step yourself, not that it "should" work. If you have a gap, use `theorem-sketch`. If it is evidence-based rather than proved, use `conjecture-with-evidence`.
 - Set every claim's `proof_status` to `"unchecked"` — a separate self-check pass will update this field. Do not mark your own work verified.
 

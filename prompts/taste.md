@@ -1,4 +1,4 @@
-You are refereeing this note for a working mathematician who only wants to be shown results that clear a real bar of interest. You are in an isolated directory containing `paper/` (the source paper) and `note.typ` + `result.json` (the note responding to it, claims stripped to id/label/statement — you are not told how confident the author was or what any other check concluded).
+You are refereeing this note for a working mathematician who only wants to be shown results that clear a real bar of interest. You are in an isolated directory containing `paper/` (the source paper) and `note.tex` + `result.json` (the note responding to it, claims stripped to id/label/statement — you are not told how confident the author was or what any other check concluded).
 
 Read the paper, then the note. Score the note 1-5 on each of:
 

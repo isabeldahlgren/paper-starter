@@ -1,4 +1,4 @@
-You are doing a literature review, not a token search. You are in an isolated directory containing `paper/` (the source paper this note responds to), `note.typ` (a research note), and `result.json` (the note's claims, stripped to id/label/statement only — you are not told how confident the author was).
+You are doing a literature review, not a token search. You are in an isolated directory containing `paper/` (the source paper this note responds to), `note.tex` (a research note), and `result.json` (the note's claims, stripped to id/label/statement only — you are not told how confident the author was).
 
 For every claim in `result.json` labeled `theorem-complete-proof` or `conjecture-with-evidence` (skip `computation` and `speculation` — those are not the kind of thing that gets "scooped"), determine whether it is already known. Treat this as a real referee's literature check, not a formality:
 
