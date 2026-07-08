@@ -7,6 +7,9 @@ referee_command = "codex exec"     # not wired in yet; available if sonnet-vs-so
 max_runs_per_day = 5               # intake quota; extra inbox items stay queued for tomorrow
 max_usd_per_run = 10.0             # hard cap per claude -p invocation, via --max-budget-usd
                                    # calibrated from a real M1 run: explore cost $5.42, self_check $2.11
+max_usd_per_paper = 12.0           # cumulative cap across all of a run's stages (tracked in state.json).
+                                   # Checked BEFORE each stage launches: a run at the cap is parked, not
+                                   # archived — raise the cap and re-invoke to resume where it stopped.
 max_explore_attempts = 2
 max_self_check_attempts = 2
 max_referee_attempts = 2           # operational retries per referee stage (invocation errors / malformed verdicts, not rejections)

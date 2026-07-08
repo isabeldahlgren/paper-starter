@@ -299,12 +299,29 @@ def run_claude(run_dir, prompt, model, allowed_tools, cfg):
     return True, proc.stdout
 
 
+def extract_cost_usd(log):
+    """Pull total_cost_usd out of a claude -p JSON result. Present even on
+    failed/aborted invocations (which still cost money); 0.0 if unparseable."""
+    m = re.search(r'"total_cost_usd"\s*:\s*([0-9.eE+-]+)', log)
+    if m:
+        with contextlib.suppress(ValueError):
+            return float(m.group(1))
+    return 0.0
+
+
+def track_cost(state, log):
+    """Accumulate per-run LLM spend in state.json; advance() parks the run
+    once it reaches max_usd_per_paper."""
+    state["cost_usd"] = round(state.get("cost_usd", 0.0) + extract_cost_usd(log), 6)
+
+
 def is_transient_failure(log):
-    """Rate/session limits and overload are not the run's fault: retrying later
-    (after the limit window resets) is free, whereas consuming an attempt or
-    archiving throws away a run that may already have survived expensive stages."""
+    """Rate/session limits, overload, and an empty API credit balance are not
+    the run's fault: retrying later (after the limit window resets or the
+    account is refilled) is free, whereas consuming an attempt or archiving
+    throws away a run that may already have survived expensive stages."""
     lowered = log.lower()
-    if any(marker in lowered for marker in ("session limit", "rate_limit", "overloaded")):
+    if any(marker in lowered for marker in ("session limit", "rate_limit", "overloaded", "credit balance", "insufficient credit")):
         return True
     return any(
         f'"api_error_status":{code}' in log.replace(" ", "")
@@ -482,6 +499,7 @@ def do_explore(run_dir, state, cfg):
 
     ok, log = run_claude(run_dir, prompt, cfg["generator_model"], GENERATOR_TOOLS, cfg)
     (run_dir / f"explore_attempt_{attempts + 1}.log").write_text(log)
+    track_cost(state, log)
     if not ok and is_transient_failure(log):
         return defer_stage(run_dir, state, "explore", log)
     state["attempts"]["explore"] = attempts + 1
@@ -514,6 +532,7 @@ def do_self_check(run_dir, state, cfg):
 
     ok, log = run_claude(run_dir, self_check_md, cfg["self_check_model"], GENERATOR_TOOLS, cfg)
     (run_dir / f"self_check_attempt_{attempts + 1}.log").write_text(log)
+    track_cost(state, log)
     if not ok and is_transient_failure(log):
         return defer_stage(run_dir, state, "self_check", log)
     state["attempts"]["self_check"] = attempts + 1
@@ -551,6 +570,7 @@ def do_novelty(run_dir, state, cfg):
 
     ok, log = run_claude(view_dir, prompt, cfg["taste_model"], "Read Write WebSearch WebFetch", cfg)
     (run_dir / f"novelty_attempt_{attempt}.log").write_text(log)
+    track_cost(state, log)
     if not ok and is_transient_failure(log):
         return defer_stage(run_dir, state, "novelty", log)
 
@@ -599,6 +619,7 @@ def do_taste(run_dir, state, cfg):
 
     ok, log = run_claude(view_dir, prompt, cfg["taste_model"], "Read Write", cfg)
     (run_dir / f"taste_attempt_{attempt}.log").write_text(log)
+    track_cost(state, log)
     if not ok and is_transient_failure(log):
         return defer_stage(run_dir, state, "taste", log)
 
@@ -641,6 +662,7 @@ def do_correctness(run_dir, state, cfg):
                 p.unlink()
         ok, log = run_claude(view_dir, prompt, cfg["referee_model"], "Read Write", cfg)
         (run_dir / f"correctness_pass{i}.log").write_text(log)
+        track_cost(state, log)
         if not ok and is_transient_failure(log):
             return defer_stage(run_dir, state, "correctness", log)
         if not ok:
@@ -690,7 +712,7 @@ def do_correctness(run_dir, state, cfg):
 def write_review_summary(dest, state):
     """Mechanical one-page SUMMARY.md for the user: claims + all gate evidence."""
     lines = [f"# {dest.name} — passed all gates", ""]
-    lines.append(f"Source paper: {state.get('paper', 'unknown')}. Compiled note: `note.pdf`; full referee reports under `referee/`.")
+    lines.append(f"Source paper: {state.get('paper', 'unknown')}. Compiled note: `note.pdf`; full referee reports under `referee/`. Total LLM cost: ${state.get('cost_usd', 0.0):.2f}.")
     lines.append("")
     try:
         claims = json.loads((dest / "result.json").read_text())["claims"]
@@ -758,7 +780,7 @@ def finalize(run_dir, state, cfg=None):
         if cfg is None or cfg.get("notify", True):
             notify_user("proof-engineering", f"{slug} passed all gates — ready for review")
     shutil.rmtree(run_dir)  # runs/ holds in-flight work only
-    print(f"[finalize] {slug} -> {dest_root}/")
+    print(f"[finalize] {slug} -> {dest_root}/ (LLM cost ${state.get('cost_usd', 0.0):.2f})")
 
 
 def advance(run_dir, cfg):
@@ -766,6 +788,23 @@ def advance(run_dir, cfg):
     stage = state["stage"]
     if stage in ("review", "archive"):
         return False
+    # Budget parking: checked BEFORE launching the next stage, so no money is
+    # wasted on a call that would be cut off mid-flight. A parked run keeps all
+    # completed-stage progress; raising max_usd_per_paper (or refilling the
+    # account and raising the cap) resumes it exactly where it stopped.
+    cap = cfg.get("max_usd_per_paper", 0)
+    spent = state.get("cost_usd", 0.0)
+    if cap and spent >= cap:
+        if not state.get("budget_parked"):
+            state["budget_parked"] = True
+            append_history(state, stage, f"parked: cumulative cost ${spent:.2f} >= max_usd_per_paper ${cap:.2f}; raise the cap in config.toml to resume")
+            save_state(run_dir, state)
+        print(f"[budget] {run_dir.name} parked at {stage}: spent ${spent:.2f} >= max_usd_per_paper ${cap:.2f}")
+        return False
+    if state.get("budget_parked"):
+        state["budget_parked"] = False
+        append_history(state, stage, "budget cap satisfied again; resuming")
+        save_state(run_dir, state)
     if stage == "explore":
         return do_explore(run_dir, state, cfg)
     if stage == "self_check":

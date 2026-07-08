@@ -47,11 +47,35 @@ python3 orchestrate.py --drain             # run every paper to a terminal state
 
 ## Cost & auth — read this before running unattended
 
-Each `claude -p` stage call is real LLM work. Observed costs on `sonnet`: explore $2–6, self_check ~$2, novelty $1–3, taste $1–2, correctness ×2 $2–4 — roughly **$8–17 per paper** end-to-end. `max_usd_per_run` caps each individual invocation.
+Each `claude -p` stage call is real LLM work. Observed costs on `sonnet`: explore $2–6, self_check ~$2, novelty $1–3, taste $1–2, correctness ×2 $2–4 — roughly **$8–17 per paper** end-to-end. Three cost layers, from softest to hardest:
+
+1. `max_usd_per_run` caps each individual `claude -p` invocation (`--max-budget-usd`).
+2. `max_usd_per_paper` caps a run's *cumulative* spend, checked before each stage launches. A run at the cap is **parked, not rejected**: all completed-stage progress stays in `state.json`, and raising the cap resumes it exactly where it stopped. Running out of API credits behaves the same way — billing errors are treated as transient, so refill and re-invoke.
+3. A workspace spend limit in the [Anthropic Console](https://console.anthropic.com) — the only cap enforced server-side no matter what the pipeline does. Set one before running unattended.
 
 **Use an `ANTHROPIC_API_KEY` (console.anthropic.com) rather than a Claude subscription for this.** Without an API key, `claude -p` authenticates via your subscription's OAuth and shares its *session-based* rate limit with your own interactive usage — an autonomous pipeline can silently eat your whole session window, and `max_usd_per_run` does not protect against that. The orchestrator treats 429/session-limit/overload responses as transient (it pauses the run and retries on a later invocation instead of consuming an attempt or archiving), but on a subscription the pipeline and your own usage still starve each other.
 
 For fully reproducible unattended runs, add `"--bare"` to `claude_extra_args` in `config.toml`: it isolates pipeline calls from your global Claude Code config (hooks, plugins, personal `CLAUDE.md` files, MCP servers). Note `--bare` authenticates **only** via `ANTHROPIC_API_KEY`. The default (`--strict-mcp-config`) already keeps your MCP servers out of pipeline calls.
+
+### Running on a Claude subscription instead (zero marginal cost, slow)
+
+If you have a Claude Pro/Max subscription and would rather spend session quota than dollars, the pipeline supports that: when it hits your session limit, every pending run pauses in place and resumes after the window resets (~5 hours). Setup:
+
+1. **Keep `ANTHROPIC_API_KEY` out of the orchestrator's environment** — the CLI prefers the key whenever it's set. If it lives in your shell profile, strip it per-invocation:
+   ```bash
+   env -u ANTHROPIC_API_KEY python3 orchestrate.py --drain
+   ```
+   `claude -p` then falls back to your subscription's OAuth login. (The preflight warning about the missing key is informational — expected in this mode.)
+2. **Don't add `--bare` to `claude_extra_args`** — bare mode authenticates only via API key and will refuse OAuth. The default flags work.
+3. **Set `max_usd_per_paper = 0` in `config.toml`.** The CLI reports a *notional* dollar cost even on subscription auth, so a nonzero cap would park runs over money you aren't actually spending. The session limit itself is your cap in this mode.
+
+Then run `--drain`: stages execute until the window is exhausted, at which point runs defer (no attempt consumed, nothing archived) and `--drain` exits cleanly; re-invoking after the reset continues exactly where it stopped. To automate the re-invoking, cron it — a tick that lands inside an exhausted window costs one tiny failed call per pending run and gives up:
+
+```
+0 * * * * cd /path/to/proof-engineering && env -u ANTHROPIC_API_KEY python3 orchestrate.py --drain >> /tmp/proof-engineering.log 2>&1
+```
+
+Two caveats. The pipeline and your interactive Claude Code usage drain the **same** window, in both directions — a long explore stage can lock you out of interactive work for hours, and vice versa; this mode is best overnight or on weekends. And expect a full paper to take a day or more of wall clock instead of one sitting. For a first end-to-end validation run, a few dollars of API credit buys you an uninterrupted traversal and real per-stage cost numbers in the ledger.
 
 ## Teaching it your taste
 
@@ -71,6 +95,7 @@ Everything in those two directories is injected into every future taste-referee 
 | `generator_model`, `self_check_model`, `taste_model`, `referee_model` | model per stage (`sonnet`, `opus`, `haiku`, …) |
 | `max_runs_per_day` | intake quota; extra inbox items stay queued |
 | `max_usd_per_run` | `--max-budget-usd` cap per `claude -p` call |
+| `max_usd_per_paper` | cumulative cap across a run's stages — at the cap the run is *parked* (progress kept), and resumes if you raise the cap; `0` disables (use on subscription auth) |
 | `max_explore_attempts`, `max_self_check_attempts` | retries before archiving |
 | `max_referee_attempts` | operational retries per referee stage (crashes/malformed verdicts — never counts a real rejection) |
 | `stage_timeout_seconds` | wall-clock limit per stage invocation |
