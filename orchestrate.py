@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import tomllib
 import urllib.request
 from pathlib import Path
@@ -31,6 +32,13 @@ VALID_LABELS = {
 VALID_STATUS = {"unchecked", "verified", "gap-found", "counterexample-found"}
 VALID_CORRECTNESS_VERDICTS = {"correct", "fixable-gap", "wrong", "cannot-verify"}
 GENERATOR_TOOLS = "Read Write Edit Bash"
+# Explore additionally gets web access: prompts/explore.md requires a
+# literature sanity check on the chosen direction BEFORE the note is written,
+# so a known result costs a few searches instead of the full explore +
+# self_check spend before the novelty gate catches it.
+EXPLORE_TOOLS = GENERATOR_TOOLS + " WebSearch WebFetch"
+# Repair only applies the self-check's listed fixes to existing files.
+REPAIR_TOOLS = "Read Edit Bash"
 REFEREE_VIEWS = ("novelty_view", "taste_view", "correctness_view")
 
 
@@ -275,7 +283,7 @@ def intake(cfg):
 
 # --- claude invocation -------------------------------------------------------
 
-def run_claude(run_dir, prompt, model, allowed_tools, cfg):
+def run_claude(run_dir, prompt, model, allowed_tools, cfg, timeout_s=None):
     cmd = [
         "claude", "-p", prompt,
         "--model", model,
@@ -289,9 +297,18 @@ def run_claude(run_dir, prompt, model, allowed_tools, cfg):
     cmd += list(cfg.get("claude_extra_args", []))
     if cfg.get("max_usd_per_run", 0):
         cmd += ["--max-budget-usd", str(cfg["max_usd_per_run"])]
-    timeout = cfg.get("stage_timeout_seconds", 1800)
+    timeout = timeout_s or cfg.get("stage_timeout_seconds", 1800)
+    env = os.environ.copy()
+    # Hard guard against backgrounded computations (prompt-level prohibition
+    # alone has failed in practice: a real run died with "Background tasks
+    # still running after 600s; terminating"). Disabling the feature removes
+    # the Bash tool's run_in_background option AND the CLI's auto-backgrounding
+    # of long foreground commands; the wait ceiling caps the shutdown tail if
+    # a stray job slips through anyway.
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "15000"
     try:
-        proc = subprocess.run(cmd, cwd=run_dir, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, cwd=run_dir, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
         return False, f"TIMEOUT after {e.timeout}s\nstdout so far:\n{e.stdout}\nstderr so far:\n{e.stderr}"
     if proc.returncode != 0:
@@ -321,7 +338,7 @@ def is_transient_failure(log):
     account is refilled) is free, whereas consuming an attempt or archiving
     throws away a run that may already have survived expensive stages."""
     lowered = log.lower()
-    if any(marker in lowered for marker in ("session limit", "rate_limit", "overloaded", "credit balance", "insufficient credit")):
+    if any(marker in lowered for marker in ("session limit", "rate_limit", "overloaded", "credit balance", "insufficient credit", "connection closed mid-response")):
         return True
     return any(
         f'"api_error_status":{code}' in log.replace(" ", "")
@@ -449,17 +466,18 @@ def fail_or_archive(run_dir, state, stage_name, reason, cfg):
     return True
 
 
-def fail_to_explore_or_archive(run_dir, state, reason, cfg):
-    """A real finding (gap, counterexample) sends the run back to explore, or archives if explore is out of attempts."""
+def fail_to_explore_or_archive(run_dir, state, stage, reason, cfg):
+    """A real but recoverable finding (gap, counterexample, partially-known
+    results) sends the run back to explore, or archives if explore is out of attempts."""
     if state["attempts"]["explore"] < cfg["max_explore_attempts"]:
         state["stage"] = "explore"
         state["feedback"] = reason
-        append_history(state, "self_check", f"failed, sending back to explore: {reason}")
+        append_history(state, stage, f"failed, sending back to explore: {reason}")
         save_state(run_dir, state)
         return True
     state["stage"] = "archive"
     state["rejection_reason"] = reason
-    append_history(state, "self_check", f"failed and explore retries exhausted: {reason}")
+    append_history(state, stage, f"failed and explore retries exhausted: {reason}")
     save_state(run_dir, state)
     finalize(run_dir, state, cfg)
     return True
@@ -493,20 +511,53 @@ def reject(run_dir, state, stage, reason, note, cfg):
     return True
 
 
+def explore_artifacts_fresh(run_dir, started_at):
+    """True if note.tex and result.json both exist and were (re)written by the
+    invocation that started at started_at — i.e. they are that invocation's own
+    output, not stale leftovers from a previous explore attempt. Used to
+    salvage a run whose invocation died (timeout, dropped connection) AFTER
+    finishing its actual work: the lint gates, not the exit code, decide."""
+    try:
+        return all((run_dir / name).stat().st_mtime >= started_at for name in ("note.tex", "result.json"))
+    except FileNotFoundError:
+        return False
+
+
+def format_feedback(feedback, limit=4000):
+    """Feedback fed back into a generator prompt. Substantive feedback (gaps,
+    novelty breakdowns) is model-written and short; operational failures embed
+    the raw CLI JSON blob, which is noise and token cost to the next attempt —
+    keep the head, which carries the actual error."""
+    if len(feedback) <= limit:
+        return feedback
+    return feedback[:limit] + "\n[... truncated: full detail in state.json history ...]"
+
+
 def do_explore(run_dir, state, cfg):
     attempts = state["attempts"]["explore"]
     prompt_md = (ROOT / "PROMPT.md").read_text()
     explore_md = (ROOT / "prompts" / "explore.md").read_text()
     explore_md = explore_md.replace("{{VENV_PYTHON}}", str(ROOT / cfg["venv_python"]))
+    explore_md = explore_md.replace("{{AUTHOR}}", cfg.get("author", "Proof Engineer"))
     prompt = prompt_md + "\n\n" + explore_md
     if state.get("feedback"):
-        prompt += f"\n\n---\n\nA previous attempt failed. Fix this and try again:\n\n{state['feedback']}\n"
+        prompt += f"\n\n---\n\nA previous attempt failed. Fix this and try again:\n\n{format_feedback(state['feedback'])}\n"
 
-    ok, log = run_claude(run_dir, prompt, cfg["generator_model"], GENERATOR_TOOLS, cfg)
+    started_at = time.time()
+    ok, log = run_claude(run_dir, prompt, cfg["generator_model"], EXPLORE_TOOLS, cfg,
+                         timeout_s=cfg.get("explore_timeout_seconds"))
     (run_dir / f"explore_attempt_{attempts + 1}.log").write_text(log)
     track_cost(state, log)
-    if not ok and is_transient_failure(log):
-        return defer_stage(run_dir, state, "explore", log)
+    if not ok:
+        # Salvage before anything else: an invocation can die (wall-clock
+        # timeout, connection dropped mid-response) after having already
+        # written a complete note. If the artifacts are its own fresh output,
+        # let the lint gates below judge them instead of discarding the work.
+        if explore_artifacts_fresh(run_dir, started_at):
+            append_history(state, "explore", "invocation reported failure but left freshly written note.tex + result.json; salvaging and applying the normal lint gates")
+            ok = True
+        elif is_transient_failure(log):
+            return defer_stage(run_dir, state, "explore", log)
     state["attempts"]["explore"] = attempts + 1
 
     if not ok:
@@ -550,7 +601,7 @@ def do_self_check(run_dir, state, cfg):
 
     valid, err = validate_result_json(run_dir / "result.json")
     if not valid:
-        return fail_to_explore_or_archive(run_dir, state, f"self-check left result.json invalid: {err}", cfg)
+        return fail_to_explore_or_archive(run_dir, state, "self_check", f"self-check left result.json invalid: {err}", cfg)
 
     claims = json.loads((run_dir / "result.json").read_text())["claims"]
     bad = [
@@ -559,12 +610,66 @@ def do_self_check(run_dir, state, cfg):
     ]
     if bad:
         details = "\n".join(f"- {c['id']}: {c['proof_status']} — {c.get('self_check_notes', '')}" for c in bad)
-        return fail_to_explore_or_archive(run_dir, state, f"Self-check found problems:\n{details}", cfg)
+        return fail_to_explore_or_archive(run_dir, state, "self_check", f"Self-check found problems:\n{details}", cfg)
 
-    state["stage"] = "novelty"
     append_history(state, "self_check", "passed: no theorem-complete-proof claim has a gap or counterexample")
+    apply_self_check_fixes(run_dir, state, cfg)
+    state["stage"] = "novelty"
     save_state(run_dir, state)
     return True
+
+
+def claim_skeleton(result_text):
+    """The structural fields of result.json that gates key off — a repair pass
+    must leave these untouched (it may only reword statements/prose)."""
+    data = json.loads(result_text)
+    return [(c.get("id"), c.get("label"), c.get("proof_status")) for c in data.get("claims", [])]
+
+
+def apply_self_check_fixes(run_dir, state, cfg):
+    """Self-check may leave self_check/fixes.md: concrete minor defects that
+    are not gaps in load-bearing proofs (prose contradicting the note's own
+    table, a mislabeled script output) and so don't justify a full explore
+    rerun — but would otherwise reach the correctness referee, whose verdict
+    on them triggers exactly that expensive loop. Apply them with one cheap
+    invocation before any referee sees the note. Best-effort: any failure
+    restores the pre-repair files and the run proceeds with the original note."""
+    fixes = run_dir / "self_check" / "fixes.md"
+    if not fixes.exists():
+        return
+    attempt = state["attempts"].get("repair", 0) + 1
+    state["attempts"]["repair"] = attempt
+    backups = {name: (run_dir / name).read_text() for name in ("note.tex", "result.json")}
+    skeleton_before = claim_skeleton(backups["result.json"])
+
+    prompt = (ROOT / "prompts" / "repair.md").read_text()
+    ok, log = run_claude(run_dir, prompt, cfg["self_check_model"], REPAIR_TOOLS, cfg)
+    (run_dir / f"repair_attempt_{attempt}.log").write_text(log)
+    track_cost(state, log)
+
+    err = None
+    if not ok:
+        err = "repair invocation failed"
+    else:
+        compile_ok, compile_err = compile_latex(run_dir)
+        if not compile_ok:
+            err = f"repaired note.tex does not compile: {compile_err}"
+        else:
+            valid, verr = validate_result_json(run_dir / "result.json")
+            if not valid:
+                err = f"repair left result.json invalid: {verr}"
+            elif claim_skeleton((run_dir / "result.json").read_text()) != skeleton_before:
+                err = "repair changed claim ids/labels/proof_status (only statements may be reworded)"
+
+    if err:
+        for name, text in backups.items():
+            (run_dir / name).write_text(text)
+        fixes.rename(fixes.with_name("fixes.failed.md"))
+        append_history(state, "self_check", f"repair pass failed, proceeding with unrepaired note: {err}")
+        print(f"[self_check] repair pass failed on {run_dir.name}; proceeding with unrepaired note")
+        return
+    fixes.rename(fixes.with_name("fixes.applied.md"))
+    append_history(state, "self_check", "repair pass applied self_check/fixes.md")
 
 
 def do_novelty(run_dir, state, cfg):
@@ -607,8 +712,26 @@ def do_novelty(run_dir, state, cfg):
     known = [c for c in verdict_claims if c.get("novelty_status") == "known"]
     if known:
         details = "\n".join(f"- {c.get('id')}: known — {c.get('reference', '')}" for c in known)
-        return reject(run_dir, state, "novelty", f"Novelty check found prior work:\n{details}",
-                      "archived: known result(s) found", cfg)
+        surviving = [c for c in verdict_claims if c.get("novelty_status") != "known"]
+        # A run whose main result is known but whose other claims survived the
+        # literature check still has salvageable content: send it back to
+        # explore to be rebuilt around the surviving claims rather than
+        # discarding the novel work along with the rediscovery. Archive only
+        # when nothing substantive survived.
+        if surviving:
+            statuses = "\n".join(f"- {c.get('id')}: {c.get('novelty_status')}" for c in surviving)
+            feedback = (
+                f"The novelty referee found that some claims are already in the literature:\n{details}\n\n"
+                f"These claims survived the literature check:\n{statuses}\n\n"
+                "Rewrite the note around the surviving claims: demote each known result to cited background "
+                "(using the references above), make the strongest surviving claim the main result, and try to "
+                "strengthen or extend it now that the known material is settled context rather than the goal. "
+                "The full novelty report is in ./referee/novelty_report.md."
+            )
+            return fail_to_explore_or_archive(run_dir, state, "novelty", feedback, cfg)
+        return reject(run_dir, state, "novelty",
+                      f"Novelty check found prior work for every substantive claim:\n{details}",
+                      "archived: all substantive claims already known", cfg)
 
     state["stage"] = "taste"
     append_history(state, "novelty", "passed: no claim found in prior literature")
@@ -700,7 +823,7 @@ def do_correctness(run_dir, state, cfg):
     if bad:
         reason = "\n".join(f"- pass {i}/{cid}: {v} — {notes}" for i, cid, v, notes in bad)
         if all(v == "fixable-gap" for _, _, v, _ in bad):
-            return fail_to_explore_or_archive(run_dir, state, f"Correctness referee found fixable gaps:\n{reason}", cfg)
+            return fail_to_explore_or_archive(run_dir, state, "correctness", f"Correctness referee found fixable gaps:\n{reason}", cfg)
         return reject(run_dir, state, "correctness",
                       f"Correctness referee found unrecoverable issues:\n{reason}",
                       "archived: wrong/cannot-verify verdict", cfg)
