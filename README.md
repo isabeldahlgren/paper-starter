@@ -18,7 +18,7 @@ inbox/ ──► explore ──► self_check ──► novelty ──► taste 
 - **explore** (generator): reads the paper, finds one or two natural follow-up questions, works them seriously (with Python/SymPy for experiments), and writes `note.tex` + `result.json`. Every claim gets an honest label: `theorem-complete-proof`, `theorem-sketch`, `conjecture-with-evidence`, `computation`, or `speculation`.
 - **self_check** (cheap kill): a fresh context adversarially re-derives every claimed proof and runs a **computational counterexample search** on small cases. Numerics beat second opinions — this is the highest-value check per dollar.
 - **novelty**: searches arXiv and the web; anything already known is archived with the reference.
-- **taste**: an independent referee scores relevance, depth, naturality, and strength against a rubric — calibrated over time by your own accept/reject decisions (see below).
+- **taste**: an independent referee scores relevance, depth, naturality, and strength against a rubric — calibrated over time by your own accept/reject decisions (see below). Taste is one of a **configurable band of pass/fail gates**: you can add your own (e.g. "has convincing experiments", "is self-contained") by dropping a prompt file in `prompts/` and one `[[gates]]` block in `config.toml` — no code changes (see [Custom gates](#custom-gates)).
 - **correctness**: two independent blind referee passes must both return `correct` on every load-bearing claim. Referees see *only* the finished note — isolation is enforced by the filesystem (each referee runs in a fresh directory containing only what it is allowed to see), not just by prompting.
 - **lean** (optional, free): every proved claim is submitted to [Aristotle](https://aristotle.harmonic.fun) (Harmonic's cloud Lean prover) for formalization. Strictly **bonus evidence, never a gate** — the run has already passed both gates and no outcome can archive it. Submission is asynchronous (proofs can take hours; the run just waits at this stage across orchestrator ticks) and costs no Anthropic tokens. A machine-checked proof is marked ✓✓ in the review summary. Skipped entirely without `ARISTOTLE_API_KEY`.
 - **review handoff**: survivors land in `review/<slug>/` with a one-page `SUMMARY.md`, the compiled PDF, and all referee reports; on macOS you get a notification.
@@ -90,13 +90,30 @@ The taste gate is the weakest gate on day one and becomes good only through feed
 
 Everything in those two directories is injected into every future taste-referee call as few-shot calibration. Early on, expect to reject things — each rejection with a reason makes the gate stronger.
 
+## Custom gates
+
+`taste` is not special — it is one entry in a list of **pass/fail gates** that run in order between the novelty and correctness stages. Add your own bar (say, "the note must contain convincing numerical experiments") in two steps, no code:
+
+1. **Write the prompt.** Copy `prompts/gate_template.md` to `prompts/experiments.md` and fill in the criteria. A gate reads `paper/` + `note.tex` + `result.json` in an isolated directory and must write `verdict.json` of the form `{"verdict": "pass" | "fail", "notes": "...", "scores": {...}}` (`scores` optional). That contract is the whole interface.
+2. **Register it.** Add a block to `config.toml`:
+
+   ```toml
+   [[gates]]
+   name = "experiments"      # -> prompts/experiments.md, writes referee/experiments.json
+   on_fail = "explore"       # "archive" (default) drops the run; "explore" sends it back to be rewritten
+   # optional: prompt, include_paper, tools, model, calibration
+   ```
+
+Gates run top-to-bottom, so put cheaper or more likely-to-fail gates first (a run killed early is a run you didn't pay to referee twice). A failing gate archives the run with its `notes` as the reason, or — with `on_fail = "explore"` — loops it back to the generator to try again. Remove the `taste` block to drop taste entirely; reorder the blocks to reorder the gates. Malformed or missing verdicts are retried (`max_referee_attempts`), never counted as a pass.
+
 ## Tuning
 
 **Prompts are files** — tuning the system means editing `prompts/*.md` and `PROMPT.md` (the research brief the generator executes; edit it to point the pipeline at your own field and standards), not code. `config.toml` holds the knobs:
 
 | key | meaning |
 |---|---|
-| `generator_model`, `self_check_model`, `taste_model`, `referee_model` | model per stage (`sonnet`, `opus`, `haiku`, …) |
+| `generator_model`, `self_check_model`, `taste_model`, `referee_model` | model per stage (`sonnet`, `opus`, `haiku`, …); `referee_model` is the default for correctness and every gate |
+| `[[gates]]` | the pass/fail gate band (see [Custom gates](#custom-gates)) — `name`, and optional `prompt`/`on_fail`/`include_paper`/`tools`/`model`/`calibration` |
 | `max_runs_per_day` | intake quota; extra inbox items stay queued |
 | `max_usd_per_run` | `--max-budget-usd` cap per `claude -p` call |
 | `max_usd_per_paper` | cumulative cap across a run's stages — at the cap the run is *parked* (progress kept), and resumes if you raise the cap; `0` disables (use on subscription auth) |

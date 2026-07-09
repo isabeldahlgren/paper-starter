@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrator: intake -> explore -> self_check -> novelty -> taste -> correctness -> review/archive.
+"""Orchestrator: intake -> explore -> self_check -> novelty -> <gates> -> correctness -> review/archive.
 
 Advances every non-terminal run by one stage per invocation (or drains all
 runs to a terminal state with --drain). Safe to re-run: state lives in
@@ -39,7 +39,14 @@ GENERATOR_TOOLS = "Read Write Edit Bash"
 EXPLORE_TOOLS = GENERATOR_TOOLS + " WebSearch WebFetch"
 # Repair only applies the self-check's listed fixes to existing files.
 REPAIR_TOOLS = "Read Edit Bash"
-REFEREE_VIEWS = ("novelty_view", "taste_view", "correctness_view")
+# Stage machinery. The pipeline is: explore -> self_check -> novelty -> <gates>
+# -> correctness -> lean -> review|archive. The head and tail stages have
+# bespoke per-claim semantics; the middle band is a user-configurable list of
+# pass/fail referee GATES (config.toml `[[gates]]`), of which `taste` ships as
+# the default. See gate_specs()/do_gate() and "Adding a custom gate" in CLAUDE.md.
+FIXED_HEAD_STAGES = ("explore", "self_check", "novelty")
+FIXED_TAIL_STAGES = ("correctness", "lean")
+RESERVED_STAGE_NAMES = set(FIXED_HEAD_STAGES) | set(FIXED_TAIL_STAGES) | {"review", "archive", "intake"}
 
 
 def load_config():
@@ -698,6 +705,97 @@ def apply_self_check_fixes(run_dir, state, cfg):
     append_history(state, "self_check", "repair pass applied self_check/fixes.md")
 
 
+def gate_specs(cfg):
+    """User-defined pass/fail referee gates (config.toml `[[gates]]`), run in
+    config order between novelty and correctness. Each is a dict with a required
+    `name` and optional `prompt`, `on_fail`, `include_paper`, `tools`, `model`,
+    `calibration` (see do_gate for the contract)."""
+    return cfg.get("gates", []) or []
+
+
+def stage_sequence(cfg):
+    """The full ordered stage list for this config, gates spliced in by name."""
+    return list(FIXED_HEAD_STAGES) + [g["name"] for g in gate_specs(cfg)] + list(FIXED_TAIL_STAGES)
+
+
+def next_stage(cfg, current):
+    """The stage a passing `current` advances to. Used by novelty and the gates
+    so the sequence stays data-driven: renaming/reordering/removing a gate in
+    config.toml just works, no transition edits needed."""
+    seq = stage_sequence(cfg)
+    i = seq.index(current)
+    return seq[i + 1] if i + 1 < len(seq) else "review"
+
+
+def validate_gate_config(cfg):
+    """Fail fast at startup on a malformed `[[gates]]` table rather than deep in
+    a run: every gate needs a unique, non-reserved name and an existing prompt."""
+    seen = set()
+    for gate in gate_specs(cfg):
+        name = gate.get("name")
+        if not name or not isinstance(name, str):
+            raise SystemExit(f"[[gates]] entry missing a string 'name': {gate!r}")
+        if name in RESERVED_STAGE_NAMES:
+            raise SystemExit(f"gate name {name!r} collides with a built-in stage; pick another")
+        if name in seen:
+            raise SystemExit(f"duplicate gate name {name!r} in config.toml")
+        seen.add(name)
+        prompt = ROOT / "prompts" / gate.get("prompt", f"{name}.md")
+        if not prompt.exists():
+            raise SystemExit(f"gate {name!r} references missing prompt file {prompt}")
+        if gate.get("on_fail", "archive") not in ("archive", "explore"):
+            raise SystemExit(f"gate {name!r} has invalid on_fail {gate.get('on_fail')!r} (expected 'archive' or 'explore')")
+
+
+def do_gate(run_dir, state, cfg, gate):
+    """A generic pass/fail referee gate — the shape shared by taste and any
+    user-added gate. Runs one isolated `claude -p` over paper+note and reads a
+    `verdict.json` of the form {"verdict": "pass"|"fail", "notes": "...",
+    "scores": {...}}. On pass -> next stage; on fail -> archive (or back to
+    explore if the gate sets on_fail = "explore"). Operational/transient
+    failures are handled exactly as the built-in referee stages."""
+    name = gate["name"]
+    (run_dir / "referee").mkdir(exist_ok=True)
+    view_dir = make_referee_dir(run_dir, f"{name}_view", include_paper=gate.get("include_paper", True))
+    prompt = (ROOT / "prompts" / gate.get("prompt", f"{name}.md")).read_text()
+    if gate.get("calibration"):
+        prompt += build_taste_calibration()
+    model = gate.get("model") or cfg.get("referee_model", "sonnet")
+    tools = gate.get("tools", "Read Write")
+    attempt = state["attempts"].get(name, 0) + 1
+
+    ok, log = run_claude(view_dir, prompt, model, tools, cfg)
+    (run_dir / f"{name}_attempt_{attempt}.log").write_text(log)
+    track_cost(state, log)
+    if not ok and is_transient_failure(log):
+        return defer_stage(run_dir, state, name, log)
+
+    if not ok:
+        return referee_stage_error(run_dir, state, name, f"invocation failed:\n{log}", cfg)
+    verdict, err = load_verdict(view_dir / "verdict.json")
+    if verdict is None:
+        return referee_stage_error(run_dir, state, name, err, cfg)
+
+    shutil.copy(view_dir / "verdict.json", run_dir / "referee" / f"{name}.json")
+    if (view_dir / "report.md").exists():
+        shutil.copy(view_dir / "report.md", run_dir / "referee" / f"{name}_report.md")
+
+    if verdict.get("verdict") not in ("pass", "fail"):
+        return referee_stage_error(run_dir, state, name, f"verdict.json has no valid 'verdict' field: {verdict.get('verdict')!r}", cfg)
+    if verdict["verdict"] != "pass":
+        reason = f"{name} gate rejected: {verdict.get('notes', '')}"
+        if verdict.get("scores"):
+            reason += f"\nScores: {verdict.get('scores')}"
+        if gate.get("on_fail") == "explore":
+            return fail_to_explore_or_archive(run_dir, state, name, reason, cfg)
+        return reject(run_dir, state, name, reason, f"archived: failed {name} gate", cfg)
+
+    state["stage"] = next_stage(cfg, name)
+    append_history(state, name, f"passed: {verdict.get('scores') or verdict.get('notes', 'ok')}")
+    save_state(run_dir, state)
+    return True
+
+
 def do_novelty(run_dir, state, cfg):
     (run_dir / "referee").mkdir(exist_ok=True)
     view_dir = make_referee_dir(run_dir, "novelty_view", include_paper=True)
@@ -759,43 +857,8 @@ def do_novelty(run_dir, state, cfg):
                       f"Novelty check found prior work for every substantive claim:\n{details}",
                       "archived: all substantive claims already known", cfg)
 
-    state["stage"] = "taste"
+    state["stage"] = next_stage(cfg, "novelty")
     append_history(state, "novelty", "passed: no claim found in prior literature")
-    save_state(run_dir, state)
-    return True
-
-
-def do_taste(run_dir, state, cfg):
-    (run_dir / "referee").mkdir(exist_ok=True)
-    view_dir = make_referee_dir(run_dir, "taste_view", include_paper=True)
-    prompt = (ROOT / "prompts" / "taste.md").read_text() + build_taste_calibration()
-    attempt = state["attempts"].get("taste", 0) + 1
-
-    ok, log = run_claude(view_dir, prompt, cfg["taste_model"], "Read Write", cfg)
-    (run_dir / f"taste_attempt_{attempt}.log").write_text(log)
-    track_cost(state, log)
-    if not ok and is_transient_failure(log):
-        return defer_stage(run_dir, state, "taste", log)
-
-    if not ok:
-        return referee_stage_error(run_dir, state, "taste", f"invocation failed:\n{log}", cfg)
-    verdict, err = load_verdict(view_dir / "verdict.json")
-    if verdict is None:
-        return referee_stage_error(run_dir, state, "taste", err, cfg)
-
-    shutil.copy(view_dir / "verdict.json", run_dir / "referee" / "taste.json")
-    if (view_dir / "report.md").exists():
-        shutil.copy(view_dir / "report.md", run_dir / "referee" / "taste_report.md")
-
-    if verdict.get("verdict") not in ("pass", "fail"):
-        return referee_stage_error(run_dir, state, "taste", f"verdict.json has no valid 'verdict' field: {verdict.get('verdict')!r}", cfg)
-    if verdict["verdict"] != "pass":
-        return reject(run_dir, state, "taste",
-                      f"Taste referee rejected: {verdict.get('notes', '')}\nScores: {verdict.get('scores')}",
-                      "archived: failed taste gate", cfg)
-
-    state["stage"] = "correctness"
-    append_history(state, "taste", f"passed: scores {verdict.get('scores')}")
     save_state(run_dir, state)
     return True
 
@@ -1034,7 +1097,7 @@ def do_lean(run_dir, state, cfg):
 
 # --- finalize ----------------------------------------------------------------
 
-def write_review_summary(dest, state):
+def write_review_summary(dest, state, cfg=None):
     """Mechanical one-page SUMMARY.md for the user: claims + all gate evidence."""
     lines = [f"# {dest.name} — passed all gates", ""]
     lines.append(f"Source paper: {state.get('paper', 'unknown')}. Compiled note: `note.pdf`; full referee reports under `referee/`. Total LLM cost: ${state.get('cost_usd', 0.0):.2f}.")
@@ -1061,9 +1124,13 @@ def write_review_summary(dest, state):
     if novelty:
         statuses = ", ".join(f"{c.get('id')}: {c.get('novelty_status')}" for c in novelty.get("claims", []))
         lines.append(f"- **Novelty:** {statuses}")
-    taste = read_json("taste.json")
-    if taste:
-        lines.append(f"- **Taste:** scores {taste.get('scores')} — {taste.get('notes', '')}")
+    for gate in gate_specs(cfg or {}):
+        g = read_json(f"{gate['name']}.json")
+        if g:
+            detail = g.get("notes", "")
+            if g.get("scores"):
+                detail = f"scores {g.get('scores')} — {detail}"
+            lines.append(f"- **{gate['name'].replace('_', ' ').title()}:** {detail}")
     for i in (1, 2):
         cp = read_json(f"correctness_pass{i}.json")
         if cp:
@@ -1105,13 +1172,13 @@ def finalize(run_dir, state, cfg=None):
     shutil.copytree(run_dir, dest)
     # strip in-flight machinery from the finalized copy
     (dest / ".lock").unlink(missing_ok=True)
-    for view in REFEREE_VIEWS:
-        shutil.rmtree(dest / view, ignore_errors=True)
+    for view in dest.glob("*_view"):  # isolated referee views (novelty_view, correctness_view, <gate>_view)
+        shutil.rmtree(view, ignore_errors=True)
     if state["stage"] == "archive":
         reason = state.get("rejection_reason", "unknown")
         (dest / "rejection.md").write_text(f"# Rejected: {slug}\n\n{reason}\n")
     else:
-        write_review_summary(dest, state)
+        write_review_summary(dest, state, cfg)
         if cfg is None or cfg.get("notify", True):
             notify_user("proof-engineering", f"{slug} passed all gates — ready for review")
     shutil.rmtree(run_dir)  # runs/ holds in-flight work only
@@ -1149,12 +1216,13 @@ def advance(run_dir, cfg):
         return do_self_check(run_dir, state, cfg)
     if stage == "novelty":
         return do_novelty(run_dir, state, cfg)
-    if stage == "taste":
-        return do_taste(run_dir, state, cfg)
     if stage == "correctness":
         return do_correctness(run_dir, state, cfg)
     if stage == "lean":
         return do_lean(run_dir, state, cfg)
+    for gate in gate_specs(cfg):
+        if stage == gate["name"]:
+            return do_gate(run_dir, state, cfg, gate)
     raise ValueError(f"unknown stage {stage!r} in {run_dir}")
 
 
@@ -1218,6 +1286,7 @@ def main():
     load_dotenv()  # before preflight: its ANTHROPIC_API_KEY warning must see .env keys
     preflight()
     cfg = load_config()
+    validate_gate_config(cfg)
     if cfg.get("lean_enabled", True) and not lean_enabled(cfg):
         print("[main] lean track unavailable (needs aristotle CLI on PATH + ARISTOTLE_API_KEY); runs will skip formalization")
     intake(cfg)

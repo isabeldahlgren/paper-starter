@@ -25,7 +25,8 @@ proof-engineering/
     self_check.md        # stage 3: generator-side adversarial pass + counterexample search
     repair.md            # stage 3b: applies self_check's listed minor fixes (fixes.md) to the note
     novelty.md           # stage 4a: prior-art search (arXiv/web)
-    taste_referee.md     # stage 4b: independent taste/relevance scoring
+    taste.md             # stage 4b: the default pass/fail gate — taste/relevance scoring
+    gate_template.md     # copy this to prompts/<name>.md to add a custom pass/fail gate ([[gates]] in config.toml)
     correctness_referee.md  # stage 5a: independent line-by-line refereeing
                          # (stage 5b, the Lean track, is mechanical — aristotle CLI, no prompt file)
   taste/
