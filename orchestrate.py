@@ -47,6 +47,32 @@ def load_config():
         return tomllib.load(f)
 
 
+def load_dotenv(path=None):
+    """Load KEY=VALUE lines from ROOT/.env into os.environ, so API keys
+    (ANTHROPIC_API_KEY, ARISTOTLE_API_KEY) don't depend on shell profiles —
+    cron/launchd invocations see them too. Variables already set in the real
+    environment always win. Corollary: to run on Claude subscription auth,
+    the key must be absent from BOTH the shell environment and .env —
+    `env -u ANTHROPIC_API_KEY` alone can't unset what .env then re-adds."""
+    path = path or (ROOT / ".env")
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -828,11 +854,182 @@ def do_correctness(run_dir, state, cfg):
                       f"Correctness referee found unrecoverable issues:\n{reason}",
                       "archived: wrong/cannot-verify verdict", cfg)
 
-    state["stage"] = "review"
     append_history(state, "correctness", "passed: both independent passes verified all load-bearing claims")
+    if lean_enabled(cfg):
+        state["stage"] = "lean"
+        append_history(state, "correctness", "entering lean formalization track (bonus evidence, non-gating)")
+        save_state(run_dir, state)
+        return True
+    state["stage"] = "review"
     save_state(run_dir, state)
     finalize(run_dir, state, cfg)
     return True
+
+
+# --- lean track (Aristotle) ----------------------------------------------------
+# Stage 5b: Lean 4 formalization as BONUS EVIDENCE, never a gate. The run has
+# already passed both gates when it arrives here, so no Aristotle outcome may
+# demote it — the only exit is review. Aristotle (Harmonic's cloud prover,
+# free: no Anthropic tokens) can take hours per claim, so submissions are
+# asynchronous (`aristotle formalize` WITHOUT --wait): the run sits at this
+# stage across orchestrator invocations, and each tick advances whatever it
+# can — submit pending claims, poll running ones, download finished ones —
+# until every claim is resolved or hits lean_timeout_minutes.
+
+ARISTOTLE_TERMINAL = {"COMPLETE", "COMPLETE_WITH_ERRORS", "OUT_OF_BUDGET", "FAILED", "CANCELED"}
+ARISTOTLE_STATUSES = ARISTOTLE_TERMINAL | {"QUEUED", "IN_PROGRESS", "UNKNOWN"}
+VALID_FORMALIZATION = {"proof-formalized", "statement-formalized", "not-formalizable"}
+
+
+def lean_enabled(cfg):
+    return (
+        bool(cfg.get("lean_enabled", True))
+        and bool(os.environ.get("ARISTOTLE_API_KEY"))
+        and shutil.which("aristotle") is not None
+    )
+
+
+def run_aristotle(args, timeout_s=180):
+    """Submit/poll/download are all quick calls (the hours happen server-side);
+    a hung CLI call must not stall the whole orchestrator tick. The CLI exits 0
+    even after logging an error (bad key, API failure) and logs to stderr, so
+    callers parse the combined output rather than trusting the return code."""
+    try:
+        proc = subprocess.run(["aristotle", *args], capture_output=True, text=True, timeout=timeout_s)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"aristotle {' '.join(args)}: {e}"
+    return proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+
+
+def parse_aristotle_task_status(log):
+    """STATUS is the last column of the first data row of `aristotle tasks`
+    output (the header row ends in the literal 'STATUS', which never matches).
+    None if no task row is visible yet — a fresh submission's task can lag the
+    project's creation."""
+    for line in log.splitlines():
+        tokens = line.split()
+        if tokens and tokens[-1] in ARISTOTLE_STATUSES:
+            return tokens[-1]
+    return None
+
+
+def lean_claim_stem(claim_id):
+    return "claim-" + (re.sub(r"[^a-zA-Z0-9_-]+", "-", claim_id).strip("-") or "unnamed")
+
+
+def write_lean_problem(run_dir, lean_dir, claim):
+    """One self-contained problem file per claim: Aristotle's formalize
+    endpoint takes a single file plus the fixed prompt "Formalize <filename>",
+    so the instructions, the statement, and the note (for definitions and
+    notation) all ride inside the file itself."""
+    path = lean_dir / f"{lean_claim_stem(claim['id'])}.tex"
+    path.write_text(
+        "Formalize the claim below as a Lean 4 theorem and prove it. "
+        "Produce a faithful, type-correct statement of exactly this claim; do not weaken or alter it to make the proof easier. "
+        "If a complete proof is out of reach, leave the faithful statement with `sorry` rather than proving a different theorem.\n\n"
+        f"CLAIM ({claim['id']}):\n\n{claim['statement']}\n\n"
+        "CONTEXT — the research note this claim is taken from, for definitions and notation:\n\n"
+        + (run_dir / "note.tex").read_text()
+    )
+    return path
+
+
+def fetch_lean_result(lean_dir, cid, entry):
+    """Download and unpack the finished project's Lean files. Best-effort: the
+    verdict is the task status Aristotle reported; missing files never change it."""
+    stem = lean_claim_stem(cid)
+    tar_path = lean_dir / f"{stem}.result.tar.gz"
+    run_aristotle(["download", entry["project_id"], "--destination", str(tar_path)])
+    if not tar_path.exists():
+        entry["download_failed"] = True
+        return
+    dest = lean_dir / stem
+    dest.mkdir(exist_ok=True)
+    try:
+        with tarfile.open(tar_path) as tf:
+            tf.extractall(dest, filter="data")
+        tar_path.unlink()
+    except (tarfile.TarError, OSError):
+        entry["download_failed"] = True
+
+
+def lean_done(run_dir, state, cfg, note):
+    state["stage"] = "review"
+    append_history(state, "lean", note)
+    save_state(run_dir, state)
+    finalize(run_dir, state, cfg)
+    return True
+
+
+def do_lean(run_dir, state, cfg):
+    if not lean_enabled(cfg):
+        return lean_done(run_dir, state, cfg, "skipped: lean_enabled=false, aristotle CLI missing, or ARISTOTLE_API_KEY unset")
+    claims = json.loads((run_dir / "result.json").read_text())["claims"]
+    targets = {c["id"]: c for c in claims if c["label"] == "theorem-complete-proof"}
+    if not targets:
+        return lean_done(run_dir, state, cfg, "skipped: no theorem-complete-proof claim to formalize")
+
+    lean_dir = run_dir / "lean"
+    lean_dir.mkdir(exist_ok=True)
+    entries = state.setdefault("lean", {})
+    for cid in targets:
+        entries.setdefault(cid, {"status": "pending"})
+    timeout_s = cfg.get("lean_timeout_minutes", 240) * 60
+    progressed = False
+
+    for cid, entry in entries.items():
+        if entry["status"] == "pending":
+            problem = write_lean_problem(run_dir, lean_dir, targets[cid])
+            ok, log = run_aristotle(["formalize", str(problem)])
+            m = re.search(r"Project created:\s*(\S+)", log)
+            if m:
+                entry.update({"status": "submitted", "project_id": m.group(1), "submitted_at": time.time()})
+                append_history(state, "lean", f"{cid}: submitted to aristotle (project {m.group(1)})")
+                progressed = True
+            elif "too many requests" in log.lower():
+                # Aristotle's concurrent-task cap, not this claim's fault:
+                # stay pending and resubmit once a slot frees up.
+                pass
+            else:
+                fails = entry["submit_failures"] = entry.get("submit_failures", 0) + 1
+                if fails >= 3:
+                    entry.update({"status": "not-formalizable", "aristotle_status": "submit-failed"})
+                    append_history(state, "lean", f"{cid}: submission failed {fails} times, marking not-formalizable: {log[:500]}")
+                    progressed = True
+        elif entry["status"] == "submitted":
+            ok, log = run_aristotle(["tasks", entry["project_id"], "--limit", "1"])
+            status = parse_aristotle_task_status(log)
+            if status in ARISTOTLE_TERMINAL:
+                entry["aristotle_status"] = status
+                if status in ("COMPLETE", "COMPLETE_WITH_ERRORS"):
+                    # COMPLETE means Aristotle proved the faithful statement;
+                    # COMPLETE_WITH_ERRORS means partial progress — count it
+                    # only as a formalized statement, never as a proof.
+                    entry["status"] = "proof-formalized" if status == "COMPLETE" else "statement-formalized"
+                    fetch_lean_result(lean_dir, cid, entry)
+                else:
+                    entry["status"] = "not-formalizable"
+                append_history(state, "lean", f"{cid}: aristotle finished {status} -> {entry['status']}")
+                progressed = True
+            elif time.time() - entry.get("submitted_at", 0) > timeout_s:
+                run_aristotle(["cancel", entry["project_id"]])  # best-effort: frees the account's concurrent-task slot
+                entry.update({"status": "not-formalizable", "aristotle_status": "timeout"})
+                append_history(state, "lean", f"{cid}: no result within lean_timeout_minutes ({cfg.get('lean_timeout_minutes', 240)}m), canceled and marked not-formalizable")
+                progressed = True
+
+    if all(e["status"] in VALID_FORMALIZATION for e in entries.values()):
+        data = json.loads((run_dir / "result.json").read_text())
+        for c in data["claims"]:
+            if c["id"] in entries:
+                c["formalization"] = entries[c["id"]]["status"]
+        (run_dir / "result.json").write_text(json.dumps(data, indent=2))
+        summary = ", ".join(f"{cid}: {e['status']}" for cid, e in sorted(entries.items()))
+        return lean_done(run_dir, state, cfg, f"lean track finished (non-gating): {summary}")
+
+    save_state(run_dir, state)
+    waiting = sum(1 for e in entries.values() if e["status"] in ("pending", "submitted"))
+    print(f"[lean] {run_dir.name}: {waiting} claim(s) still with aristotle; will poll on a later invocation")
+    return progressed
 
 
 # --- finalize ----------------------------------------------------------------
@@ -872,8 +1069,18 @@ def write_review_summary(dest, state):
         if cp:
             verdicts = ", ".join(f"{c.get('id')}: {c.get('verdict')}" for c in cp.get("claims", []))
             lines.append(f"- **Correctness pass {i}:** {verdicts}")
+    lean_bits = []
+    for c in claims:
+        f = c.get("formalization")
+        if f:
+            lean_bits.append(f"{c.get('id')}: {f}" + (" ✓✓" if f == "proof-formalized" else ""))
+    if lean_bits:
+        lines.append(f"- **Lean track (Aristotle, non-gating):** {', '.join(lean_bits)} — Lean sources under `lean/`")
     lines.append("")
-    lines.append("Verification caveat: apart from the self-check's computational counterexample search, all gates are LLM refereeing — treat as \"survived independent refereeing\", not as certainty.")
+    caveat = "Verification caveat: apart from the self-check's computational counterexample search, all gates are LLM refereeing — treat as \"survived independent refereeing\", not as certainty."
+    if any(c.get("formalization") == "proof-formalized" for c in claims):
+        caveat += " Exception: claims marked ✓✓ carry a machine-checked Lean proof from the Aristotle track."
+    lines.append(caveat)
     lines.append("")
     (dest / "SUMMARY.md").write_text("\n".join(lines))
 
@@ -920,9 +1127,12 @@ def advance(run_dir, cfg):
     # wasted on a call that would be cut off mid-flight. A parked run keeps all
     # completed-stage progress; raising max_usd_per_paper (or refilling the
     # account and raising the cap) resumes it exactly where it stopped.
+    # The lean stage is exempt from parking: Aristotle costs no LLM dollars,
+    # and parking a run that already passed both gates on its free bonus stage
+    # would only delay the review handoff.
     cap = cfg.get("max_usd_per_paper", 0)
     spent = state.get("cost_usd", 0.0)
-    if cap and spent >= cap:
+    if cap and spent >= cap and stage != "lean":
         if not state.get("budget_parked"):
             state["budget_parked"] = True
             append_history(state, stage, f"parked: cumulative cost ${spent:.2f} >= max_usd_per_paper ${cap:.2f}; raise the cap in config.toml to resume")
@@ -943,6 +1153,8 @@ def advance(run_dir, cfg):
         return do_taste(run_dir, state, cfg)
     if stage == "correctness":
         return do_correctness(run_dir, state, cfg)
+    if stage == "lean":
+        return do_lean(run_dir, state, cfg)
     raise ValueError(f"unknown stage {stage!r} in {run_dir}")
 
 
@@ -1003,8 +1215,11 @@ def main():
                          help="advance only runs/<SLUG>, ignoring all other pending runs")
     args = parser.parse_args()
 
+    load_dotenv()  # before preflight: its ANTHROPIC_API_KEY warning must see .env keys
     preflight()
     cfg = load_config()
+    if cfg.get("lean_enabled", True) and not lean_enabled(cfg):
+        print("[main] lean track unavailable (needs aristotle CLI on PATH + ARISTOTLE_API_KEY); runs will skip formalization")
     intake(cfg)
 
     max_sweeps = 50 if args.drain else 1

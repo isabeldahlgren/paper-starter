@@ -12,6 +12,7 @@ taste/rejected/*
 !taste/rejected/.gitkeep
 
 # environment / tooling
+.env
 .venv/
 __pycache__/
 *.pyc

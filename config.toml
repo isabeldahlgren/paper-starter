@@ -28,5 +28,12 @@ explore_timeout_seconds = 3600     # explore runs experiments AND writes the not
 claude_extra_args = ["--strict-mcp-config"]
 
 notify = true                      # macOS notification when a run lands in review/
-lean_timeout_minutes = 30          # unused until M3 (aristotle formalize)
+
+lean_enabled = true                # stage 5b: after the correctness gate, submit each theorem-complete-proof
+                                   # claim to Aristotle (Harmonic's cloud Lean prover) for formalization.
+                                   # Bonus evidence, never a gate — no outcome can archive the run. Free (no
+                                   # Anthropic tokens); needs the aristotle CLI (uv tool install aristotlelib)
+                                   # + ARISTOTLE_API_KEY, and is skipped without them.
+lean_timeout_minutes = 240         # per-claim wall clock from submission; Aristotle proofs can take hours.
+                                   # On timeout the task is canceled and the claim marked not-formalizable.
 venv_python = ".venv/bin/python3"
