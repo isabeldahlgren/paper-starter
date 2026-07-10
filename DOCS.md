@@ -1,4 +1,4 @@
-# Customizing proof-engineering
+# Customizing paper-starter
 
 This is the guide for making the pipeline your own. For a first run see the [README](README.md); for the full design rationale see [PLAN.md](PLAN.md).
 
@@ -20,7 +20,7 @@ Every key is optional. Anything you omit falls back to `CONFIG_DEFAULTS` at the 
 
 | Key | Default | Meaning |
 |---|---|---|
-| `author` | `"Proof Engineer"` | Goes in `\author{}` on every note. Set it to your name. |
+| `author` | `"Starter"` | Goes in `\author{}` on every note. Set it to your name. |
 | `generator_model` | `sonnet` | Model for the explore stage. |
 | `self_check_model` | `sonnet` | Model for self-check and the repair pass. |
 | `taste_model` | `sonnet` | Model for the novelty-search referee. |
@@ -104,7 +104,7 @@ To spend session quota instead of dollars:
 When the window is exhausted, pending runs defer (no attempt consumed) and `--drain` exits cleanly; re-invoke after the reset (~5 hours) to continue. To automate, cron it:
 
 ```cron
-0 * * * * cd /path/to/proof-engineering && env -u ANTHROPIC_API_KEY python3 orchestrate.py --drain >> /tmp/proof-engineering.log 2>&1
+0 * * * * cd /path/to/paper-starter && env -u ANTHROPIC_API_KEY python3 orchestrate.py --drain >> /tmp/paper-starter.log 2>&1
 ```
 
 Caveat: the pipeline and your interactive Claude Code usage drain the same window in both directions — best overnight or on weekends — and a full paper can take a day of wall clock. For a first end-to-end run, a few dollars of API credit buys an uninterrupted traversal and real per-stage cost numbers.

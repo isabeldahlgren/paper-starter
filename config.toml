@@ -1,9 +1,9 @@
-# proof-engineering config. Every key is optional — delete any line to take the
+# paper-starter config. Every key is optional — delete any line to take the
 # default from orchestrate.py's CONFIG_DEFAULTS. This file only needs the values
 # you want to override. Full explanation of each key, and how to add your own
 # gates, is in DOCS.md.
 
-author = "Proof Engineer"          # goes in \author{} on every note
+author = "Starter"                 # goes in \author{} on every note
 
 # Model per stage (sonnet | opus | haiku | ...).
 generator_model = "sonnet"

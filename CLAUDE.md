@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`proof-engineering` is an autonomous research pipeline for pure mathematics. It reads a paper, executes `PROMPT.md` against it via headless Claude Code, and iterates until a result independently passes both a taste gate and a correctness gate. It optimizes for quality over volume — a yield of one reviewable result per ~10 papers is considered success. `PLAN.md` is the authoritative spec (design principles, directory layout, pipeline stages, milestones); read it before making structural changes, since this file only summarizes it.
+`paper-starter` is an autonomous research pipeline for pure mathematics. It reads a paper, executes `PROMPT.md` against it via headless Claude Code, and iterates until a result independently passes both a taste gate and a correctness gate. It optimizes for quality over volume — a yield of one reviewable result per ~10 papers is considered success. `PLAN.md` is the authoritative spec (design principles, directory layout, pipeline stages, milestones); read it before making structural changes, since this file only summarizes it.
 
 **Doc layout** (three audiences — keep them in their lanes when editing): `README.md` is the newcomer quickstart (kept deliberately short — what it is, requirements, quickstart, "the three files you edit"); `DOCS.md` is the customization/reference guide (full config table, how to add gates, cost & auth, subscription-vs-API, the Lean track); `PLAN.md` is the design spec. Deep rationale belongs in DOCS.md or PLAN.md, not in README.md or as prose essays in `config.toml`.
 

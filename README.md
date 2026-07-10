@@ -1,4 +1,4 @@
-# proof-engineering
+# paper-starter
 
 An autonomous research pipeline for pure mathematics. You drop papers into an inbox; it reads each one as a research collaborator, finds a follow-up question, works it out (proof, counterexample search, computation), writes a short LaTeX note — and only shows you results that independently pass a **taste gate** and a **correctness gate**.
 
@@ -25,7 +25,7 @@ Everything is files — no server, no queue. `orchestrate.py` is one stdlib-only
 ## Quickstart
 
 ```bash
-git clone <this repo> && cd proof-engineering
+git clone <this repo> && cd paper-starter
 python3 -m venv .venv && .venv/bin/pip install sympy mpmath
 cp .env.example .env                       # then add your ANTHROPIC_API_KEY
 

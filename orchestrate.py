@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""proof-engineering orchestrator — the whole pipeline in one stdlib-only file.
+"""paper-starter orchestrator — the whole pipeline in one stdlib-only file.
 
 READING GUIDE
 =============
@@ -81,7 +81,7 @@ RESERVED_STAGE_NAMES = set(FIXED_HEAD_STAGES) | set(FIXED_TAIL_STAGES) | {"revie
 # all) still runs. config.toml only needs to hold the values you want to
 # override; the essays explaining each key live in DOCS.md, not here.
 CONFIG_DEFAULTS = {
-    "author": "Proof Engineer",
+    "author": "Starter",
     "generator_model": "sonnet",
     "self_check_model": "sonnet",
     "taste_model": "sonnet",
@@ -179,7 +179,7 @@ def slugify_pdf(path):
 
 def fetch_arxiv_source(arxiv_id, dest_dir):
     url = f"https://arxiv.org/e-print/{arxiv_id}"
-    req = urllib.request.Request(url, headers={"User-Agent": "proof-engineering/0.1 (research pipeline)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "paper-starter/0.1 (research pipeline)"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = resp.read()
     raw_path = dest_dir / "raw.download"
@@ -629,7 +629,7 @@ def do_explore(run_dir, state, cfg):
     prompt_md = (ROOT / "PROMPT.md").read_text()
     explore_md = (ROOT / "prompts" / "explore.md").read_text()
     explore_md = explore_md.replace("{{VENV_PYTHON}}", str(ROOT / cfg["venv_python"]))
-    explore_md = explore_md.replace("{{AUTHOR}}", cfg.get("author", "Proof Engineer"))
+    explore_md = explore_md.replace("{{AUTHOR}}", cfg.get("author", "Starter"))
     prompt = prompt_md + "\n\n" + explore_md
     if state.get("feedback"):
         prompt += f"\n\n---\n\nA previous attempt failed. Fix this and try again:\n\n{format_feedback(state['feedback'])}\n"
@@ -1238,7 +1238,7 @@ def finalize(run_dir, state, cfg=None):
     else:
         write_review_summary(dest, state, cfg)
         if cfg is None or cfg.get("notify", True):
-            notify_user("proof-engineering", f"{slug} passed all gates — ready for review")
+            notify_user("paper-starter", f"{slug} passed all gates — ready for review")
     shutil.rmtree(run_dir)  # runs/ holds in-flight work only
     print(f"[finalize] {slug} -> {dest_root}/ (LLM cost ${state.get('cost_usd', 0.0):.2f})")
 
