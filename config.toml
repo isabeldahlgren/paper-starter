@@ -1,59 +1,48 @@
-author = "Proof Engineer"          # \author{} on every note — set this to your name for journal-ready output
+# proof-engineering config. Every key is optional — delete any line to take the
+# default from orchestrate.py's CONFIG_DEFAULTS. This file only needs the values
+# you want to override. Full explanation of each key, and how to add your own
+# gates, is in DOCS.md.
 
+author = "Proof Engineer"          # goes in \author{} on every note
+
+# Model per stage (sonnet | opus | haiku | ...).
 generator_model = "sonnet"
 self_check_model = "sonnet"
-taste_model = "sonnet"             # independent fresh-context novelty search referee
-referee_model = "sonnet"           # default model for correctness (two passes) AND any [[gates]] below
-referee_command = "codex exec"     # not wired in yet; available if sonnet-vs-sonnet independence proves too weak
+taste_model = "sonnet"             # novelty-search referee
+referee_model = "sonnet"           # default for correctness + every gate below
 
-# --- Custom gates ----------------------------------------------------------
-# Pass/fail referee gates, run in listed order between the novelty and
-# correctness stages. Each runs one isolated `claude -p` over paper+note and
-# must write verdict.json {"verdict": "pass"|"fail", "notes": "...", scores?}.
-# To add your own gate: drop prompts/<name>.md (copy the taste.md contract) and
-# add a [[gates]] block here. Keys: name (required); prompt (default
-# "<name>.md"); on_fail = "archive" (default) | "explore" (loop back to rewrite);
-# include_paper (default true); tools (default "Read Write"); model (default
-# referee_model); calibration (default false — append taste/{accepted,rejected}
-# few-shot examples). Remove the taste block to drop the taste gate entirely.
+# --- Gates: the pass/fail referee band, run in order between novelty and
+# correctness. `taste` ships as the default. Add your own with no code — drop
+# prompts/<name>.md (copy prompts/gate_template.md) and add a [[gates]] block.
+# Keys: name (required); prompt, on_fail (archive|explore), include_paper,
+# tools, model, calibration. See DOCS.md > Custom gates.
 [[gates]]
 name = "taste"
 on_fail = "archive"
-calibration = true
+calibration = true                 # inject taste/{accepted,rejected} as few-shot examples
 
-# Example of a second, user-added gate (uncomment prompts/experiments.md first):
-# [[gates]]
-# name = "experiments"
-# on_fail = "explore"
-
-max_runs_per_day = 5               # intake quota; extra inbox items stay queued for tomorrow
-max_usd_per_run = 10.0             # hard cap per claude -p invocation, via --max-budget-usd
-                                   # calibrated from a real M1 run: explore cost $5.42, self_check $2.11
-max_usd_per_paper = 0           # cumulative cap across all of a run's stages (tracked in state.json).
-                                   # Checked BEFORE each stage launches: a run at the cap is parked, not
-                                   # archived — raise the cap and re-invoke to resume where it stopped.
+# --- Budgets & retries -----------------------------------------------------
+max_runs_per_day = 5               # intake quota; extra inbox items stay queued
+max_usd_per_run = 10.0             # cap per claude -p call (--max-budget-usd)
+max_usd_per_paper = 0              # cumulative cap per run; 0 = off. At the cap a run is
+                                   # parked (progress kept), not archived. Use 0 on
+                                   # subscription auth — see DOCS.md > Cost & auth.
 max_explore_attempts = 2
 max_self_check_attempts = 2
-max_referee_attempts = 2           # operational retries per referee stage (invocation errors / malformed verdicts, not rejections)
-stage_timeout_seconds = 1800       # wall-clock limit per claude -p invocation
-explore_timeout_seconds = 3600     # explore runs experiments AND writes the note — a real run hit the
-                                   # 1800s ceiling with nothing captured; give the expensive stage headroom
+max_referee_attempts = 2           # operational retries per referee stage (not rejections)
+stage_timeout_seconds = 1800       # wall-clock per claude -p call
+explore_timeout_seconds = 3600     # explore runs experiments + writes the note; give it headroom
 
-# Extra flags passed to every `claude -p` invocation.
-# --strict-mcp-config keeps your personal MCP servers (and their token cost)
-# out of pipeline calls. Add "--bare" for full isolation from your global
-# Claude Code config (hooks, CLAUDE.md auto-discovery, plugins) — recommended
-# for unattended operation, but note --bare authenticates ONLY via
-# ANTHROPIC_API_KEY (subscription OAuth is never read in bare mode).
+# Extra flags on every claude -p call. --strict-mcp-config keeps your personal
+# MCP servers out of pipeline calls. Add "--bare" for full isolation from your
+# global Claude config (requires ANTHROPIC_API_KEY; ignores subscription OAuth).
 claude_extra_args = ["--strict-mcp-config"]
 
-notify = true                      # macOS notification when a run lands in review/
+notify = true                      # macOS notification when a run reaches review/
 
-lean_enabled = true                # stage 5b: after the correctness gate, submit each theorem-complete-proof
-                                   # claim to Aristotle (Harmonic's cloud Lean prover) for formalization.
-                                   # Bonus evidence, never a gate — no outcome can archive the run. Free (no
-                                   # Anthropic tokens); needs the aristotle CLI (uv tool install aristotlelib)
-                                   # + ARISTOTLE_API_KEY, and is skipped without them.
-lean_timeout_minutes = 240         # per-claim wall clock from submission; Aristotle proofs can take hours.
-                                   # On timeout the task is canceled and the claim marked not-formalizable.
-venv_python = ".venv/bin/python3"
+# --- Lean track (optional, free, non-gating) -------------------------------
+lean_enabled = true                # formalize proved claims via Aristotle after correctness.
+                                   # Needs the aristotle CLI + ARISTOTLE_API_KEY; skipped without them.
+lean_timeout_minutes = 240         # per-claim wall clock; on timeout the task is canceled.
+
+venv_python = ".venv/bin/python3"  # interpreter offered to the generator for experiments

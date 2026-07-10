@@ -1,9 +1,37 @@
 #!/usr/bin/env python3
-"""Orchestrator: intake -> explore -> self_check -> novelty -> <gates> -> correctness -> review/archive.
+"""proof-engineering orchestrator — the whole pipeline in one stdlib-only file.
 
-Advances every non-terminal run by one stage per invocation (or drains all
-runs to a terminal state with --drain). Safe to re-run: state lives in
-runs/<slug>/state.json, and terminal runs (review/archive) are left alone.
+READING GUIDE
+=============
+The pipeline moves each paper through a sequence of stages, one stage per
+invocation (or all the way with --drain):
+
+    inbox/  ->  explore  ->  self_check  ->  novelty  ->  <gates>  ->  correctness  ->  lean  ->  review/
+                (generate)   (cheap kill)   (prior art)  (taste...)   (2 passes)     (bonus)      archive/
+
+Every run is a directory under runs/<slug>/ with a state.json recording which
+stage it is at. There is no server and no queue: the filesystem IS the database,
+re-running the orchestrator just continues unfinished runs, and it is safe to
+run concurrently (per-run .lock file).
+
+Each stage is one call to `claude -p` driven by a prompt file in prompts/.
+Tuning the system means editing those prompts and config.toml, not this code.
+
+WHERE TO LOOK
+-------------
+    main()          entry point: load .env, preflight, intake, then advance runs
+    advance()       the stage dispatcher — maps state["stage"] to a do_* function
+    intake()        watches inbox/, creates runs/<slug>/ (intake_arxiv/intake_pdf)
+    do_explore()    stage 1: generator writes note.tex + result.json  (prompts/explore.md)
+    do_self_check() stage 2: adversarial re-derivation + counterexample search
+    do_novelty()    stage 3: prior-art search referee
+    do_gate()       stage 4: the generic pass/fail gates (taste + any you add)
+    do_correctness()stage 5: two independent blind referee passes
+    do_lean()       stage 5b: optional Aristotle/Lean formalization (bonus, non-gating)
+    finalize()      moves a finished run into review/ or archive/
+
+Stage order is data-driven (stage_sequence()): a fixed head/tail with the
+user-configurable [[gates]] band spliced in the middle. See DOCS.md to customize.
 """
 import argparse
 import contextlib
@@ -49,9 +77,39 @@ FIXED_TAIL_STAGES = ("correctness", "lean")
 RESERVED_STAGE_NAMES = set(FIXED_HEAD_STAGES) | set(FIXED_TAIL_STAGES) | {"review", "archive", "intake"}
 
 
+# Defaults for every optional config.toml key, so a minimal config (or none at
+# all) still runs. config.toml only needs to hold the values you want to
+# override; the essays explaining each key live in DOCS.md, not here.
+CONFIG_DEFAULTS = {
+    "author": "Proof Engineer",
+    "generator_model": "sonnet",
+    "self_check_model": "sonnet",
+    "taste_model": "sonnet",
+    "referee_model": "sonnet",
+    "gates": [{"name": "taste", "on_fail": "archive", "calibration": True}],
+    "max_runs_per_day": 5,
+    "max_usd_per_run": 10.0,
+    "max_usd_per_paper": 0,
+    "max_explore_attempts": 2,
+    "max_self_check_attempts": 2,
+    "max_referee_attempts": 2,
+    "stage_timeout_seconds": 1800,
+    "explore_timeout_seconds": 3600,
+    "claude_extra_args": ["--strict-mcp-config"],
+    "notify": True,
+    "lean_enabled": True,
+    "lean_timeout_minutes": 240,
+    "venv_python": ".venv/bin/python3",
+}
+
+
 def load_config():
-    with open(ROOT / "config.toml", "rb") as f:
-        return tomllib.load(f)
+    cfg = dict(CONFIG_DEFAULTS)
+    path = ROOT / "config.toml"
+    if path.exists():
+        with open(path, "rb") as f:
+            cfg.update(tomllib.load(f))
+    return cfg
 
 
 def load_dotenv(path=None):
@@ -1263,6 +1321,30 @@ def list_run_dirs():
     return sorted(p for p in runs_dir.iterdir() if p.is_dir())
 
 
+def print_status():
+    """A quick human-readable snapshot of every run and where it sits. Read-only:
+    never advances anything, so it is always safe to call (`orchestrate.py --status`)."""
+    for root, header in (("runs", "IN FLIGHT"), ("review", "REVIEW (passed all gates)"), ("archive", "ARCHIVED")):
+        base = ROOT / root
+        dirs = sorted(p for p in base.iterdir() if p.is_dir()) if base.exists() else []
+        print(f"\n{header} — {len(dirs)}")
+        for run in dirs:
+            try:
+                state = json.loads((run / "state.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                print(f"  {run.name}: (no readable state.json)")
+                continue
+            stage = state.get("stage", "?")
+            cost = state.get("cost_usd", 0.0)
+            extra = ""
+            if root == "archive" and state.get("rejection_reason"):
+                extra = f" — {state['rejection_reason'].splitlines()[0][:80]}"
+            if state.get("budget_parked"):
+                extra = " — PARKED (raise max_usd_per_paper to resume)" + extra
+            print(f"  {run.name}: {stage} (${cost:.2f}){extra}")
+    print()
+
+
 def preflight():
     missing = [tool for tool in ("claude", "latexmk") if shutil.which(tool) is None]
     if missing:
@@ -1281,7 +1363,13 @@ def main():
                          help="keep advancing every run until all are terminal (review/archive)")
     parser.add_argument("--only", metavar="SLUG",
                          help="advance only runs/<SLUG>, ignoring all other pending runs")
+    parser.add_argument("--status", action="store_true",
+                         help="print where every run stands and exit (advances nothing)")
     args = parser.parse_args()
+
+    if args.status:
+        print_status()
+        return
 
     load_dotenv()  # before preflight: its ANTHROPIC_API_KEY warning must see .env keys
     preflight()
