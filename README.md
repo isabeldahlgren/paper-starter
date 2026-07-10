@@ -27,11 +27,12 @@ Everything is files — no server, no queue. `orchestrate.py` is one stdlib-only
 ```bash
 git clone <this repo> && cd paper-starter
 python3 -m venv .venv && .venv/bin/pip install sympy mpmath
-cp .env.example .env                       # then add your ANTHROPIC_API_KEY
 
 echo "2505.11846" > inbox/queue.txt        # arXiv IDs, one per line (or drop PDFs in inbox/)
 python3 orchestrate.py --drain             # run every paper to review/ or archive/
 ```
+
+This runs on your Claude subscription by default (zero marginal cost) — just make sure `claude` is logged in. Add an `ANTHROPIC_API_KEY` in `.env` (copy from `.env.example`) if you'd rather pay per token and not touch your session limits — see [DOCS.md → Cost & auth](DOCS.md#cost--auth).
 
 - `python3 orchestrate.py` advances every run by one stage (the cron-friendly mode).
 - `--drain` loops until everything is terminal; `--only <slug>` restricts to one run.
@@ -39,7 +40,7 @@ python3 orchestrate.py --drain             # run every paper to review/ or archi
 
 Survivors land in `review/<slug>/` with a one-page `SUMMARY.md`, the compiled PDF, and all referee reports (on macOS you also get a notification). Rejections land in `archive/<slug>/` with a `rejection.md`.
 
-> **Before running unattended, read [DOCS.md → Cost & auth](DOCS.md#cost--auth).** Each paper costs roughly $8–17 in LLM calls. Strongly prefer an `ANTHROPIC_API_KEY` over your Claude subscription, and set a spend limit in the [Anthropic Console](https://console.anthropic.com).
+> **Before running unattended, read [DOCS.md → Cost & auth](DOCS.md#cost--auth).** On a subscription, an autonomous pipeline can eat your whole session window. With an `ANTHROPIC_API_KEY` each paper costs roughly $8–15 in LLM calls instead — set a spend limit in the [Anthropic Console](https://console.anthropic.com).
 
 ## The three files you edit
 
