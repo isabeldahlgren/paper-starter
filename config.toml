@@ -1,37 +1,17 @@
 # paper-starter config. Every key is optional — delete any line to take the
 # default from orchestrate.py's CONFIG_DEFAULTS. This file only needs the values
-# you want to override. Full explanation of each key, and how to add your own
-# gates, is in DOCS.md.
+# you want to override. Full explanation of each key is in DOCS.md.
 
-author = "Starter"                 # goes in \author{} on every note
-
-# Model per stage (sonnet | opus | haiku | ...).
-generator_model = "sonnet"
-self_check_model = "sonnet"
-taste_model = "sonnet"             # novelty-search referee
-referee_model = "sonnet"           # default for correctness + every gate below
-
-# --- Gates: the pass/fail referee band, run in order between novelty and
-# correctness. `taste` ships as the default. Add your own with no code — drop
-# prompts/<name>.md (copy prompts/gate_template.md) and add a [[gates]] block.
-# Keys: name (required); prompt, on_fail (archive|explore), include_paper,
-# tools, model, calibration. See DOCS.md > Custom gates.
-[[gates]]
-name = "taste"
-on_fail = "archive"
-calibration = true                 # inject taste/{accepted,rejected} as few-shot examples
+referee_model = "opus"             # model for crosscheck + rank (a different family than GPT)
 
 # --- Budgets & retries -----------------------------------------------------
-max_runs_per_day = 5               # intake quota; extra inbox items stay queued
+max_runs_per_day = 10              # intake quota; extra inbox folders stay queued
 max_usd_per_run = 10.0             # cap per claude -p call (--max-budget-usd)
 max_usd_per_paper = 0              # cumulative cap per run; 0 = off. At the cap a run is
                                    # parked (progress kept), not archived. Use 0 on
                                    # subscription auth — see DOCS.md > Cost & auth.
-max_explore_attempts = 2
-max_self_check_attempts = 2
-max_referee_attempts = 2           # operational retries per referee stage (not rejections)
-stage_timeout_seconds = 1800       # wall-clock per claude -p call
-explore_timeout_seconds = 3600     # explore runs experiments + writes the note; give it headroom
+max_referee_attempts = 2           # operational retries for crosscheck (not rejections)
+stage_timeout_seconds = 3600       # wall-clock per claude -p call (crosscheck re-runs computations)
 
 # Extra flags on every claude -p call. --strict-mcp-config keeps your personal
 # MCP servers out of pipeline calls. Add "--bare" for full isolation from your
@@ -41,8 +21,8 @@ claude_extra_args = ["--strict-mcp-config"]
 notify = true                      # macOS notification when a run reaches review/
 
 # --- Lean track (optional, free, non-gating) -------------------------------
-lean_enabled = true                # formalize proved claims via Aristotle after correctness.
+lean_enabled = true                # formalize proved claims via Aristotle after crosscheck.
                                    # Needs the aristotle CLI + ARISTOTLE_API_KEY; skipped without them.
 lean_timeout_minutes = 240         # per-claim wall clock; on timeout the task is canceled.
 
-venv_python = ".venv/bin/python3"  # interpreter offered to the generator for experiments
+venv_python = ".venv/bin/python3"  # interpreter the crosscheck referee uses to re-run computations

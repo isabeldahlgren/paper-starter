@@ -1,37 +1,44 @@
 #!/usr/bin/env python3
 """paper-starter orchestrator — the whole pipeline in one stdlib-only file.
 
-READING GUIDE
-=============
-The pipeline moves each paper through a sequence of stages, one stage per
-invocation (or all the way with --drain):
+WHAT THIS IS
+============
+You generate candidate research notes elsewhere (run GPT-PROMPT.md in a chat
+window; it emits one folder per project with note.tex + result.json). This tool
+takes those folders and, on your Claude subscription, does the three things a
+chat window can't:
 
-    inbox/  ->  explore  ->  self_check  ->  novelty  ->  <gates>  ->  correctness  ->  lean  ->  review/
-                (generate)   (cheap kill)   (prior art)  (taste...)   (2 passes)     (bonus)      archive/
+    inbox/  ->  crosscheck  ->  lean  ->  review/     -->  PRIORITY.md
+    (a GPT     (a DIFFERENT   (Aristotle  archive/
+     project    model         formalizes
+     folder)    referees it)   proofs)
+
+    crosscheck  one isolated `claude -p` pass: re-derive the proofs, check the
+                literature, judge the taste. GPT wrote the note, so a different
+                model refereeing it is genuine independence — pass -> lean,
+                fail -> archive with the referee's reasons.
+    lean        Aristotle (Harmonic's cloud Lean prover) formalizes each proved
+                claim. Bonus evidence, never a gate; free (no Anthropic tokens).
+    rank        across everything that passed, Claude writes PRIORITY.md — a
+                ranked reading list, because your reading time is the bottleneck.
 
 Every run is a directory under runs/<slug>/ with a state.json recording which
 stage it is at. There is no server and no queue: the filesystem IS the database,
 re-running the orchestrator just continues unfinished runs, and it is safe to
 run concurrently (per-run .lock file).
 
-Each stage is one call to `claude -p` driven by a prompt file in prompts/.
-Tuning the system means editing those prompts and config.toml, not this code.
-
 WHERE TO LOOK
 -------------
-    main()          entry point: load .env, preflight, intake, then advance runs
-    advance()       the stage dispatcher — maps state["stage"] to a do_* function
-    intake()        watches inbox/, creates runs/<slug>/ (intake_arxiv/intake_pdf)
-    do_explore()    stage 1: generator writes note.tex + result.json  (prompts/explore.md)
-    do_self_check() stage 2: adversarial re-derivation + counterexample search
-    do_novelty()    stage 3: prior-art search referee
-    do_gate()       stage 4: the generic pass/fail gates (taste + any you add)
-    do_correctness()stage 5: two independent blind referee passes
-    do_lean()       stage 5b: optional Aristotle/Lean formalization (bonus, non-gating)
-    finalize()      moves a finished run into review/ or archive/
+    main()           entry point: load .env, preflight, intake, advance, rank
+    advance()        the stage dispatcher — maps state["stage"] to a do_* function
+    intake()         watches inbox/ for GPT project folders (intake_folder)
+    do_crosscheck()  the one referee stage: correctness + novelty + taste
+    do_lean()        optional Aristotle/Lean formalization (bonus, non-gating)
+    finalize()       moves a finished run into review/ or archive/
+    do_rank()        writes PRIORITY.md — the ranked reading list
 
-Stage order is data-driven (stage_sequence()): a fixed head/tail with the
-user-configurable [[gates]] band spliced in the middle. See DOCS.md to customize.
+Tuning the system means editing prompts/crosscheck.md, prompts/rank.md and
+config.toml, not this code.
 """
 import argparse
 import contextlib
@@ -59,42 +66,22 @@ VALID_LABELS = {
 }
 VALID_STATUS = {"unchecked", "verified", "gap-found", "counterexample-found"}
 VALID_CORRECTNESS_VERDICTS = {"correct", "fixable-gap", "wrong", "cannot-verify"}
-GENERATOR_TOOLS = "Read Write Edit Bash"
-# Explore additionally gets web access: prompts/explore.md requires a
-# literature sanity check on the chosen direction BEFORE the note is written,
-# so a known result costs a few searches instead of the full explore +
-# self_check spend before the novelty gate catches it.
-EXPLORE_TOOLS = GENERATOR_TOOLS + " WebSearch WebFetch"
-# Repair only applies the self-check's listed fixes to existing files.
-REPAIR_TOOLS = "Read Edit Bash"
-# Stage machinery. The pipeline is: explore -> self_check -> novelty -> <gates>
-# -> correctness -> lean -> review|archive. The head and tail stages have
-# bespoke per-claim semantics; the middle band is a user-configurable list of
-# pass/fail referee GATES (config.toml `[[gates]]`), of which `taste` ships as
-# the default. See gate_specs()/do_gate() and "Adding a custom gate" in CLAUDE.md.
-FIXED_HEAD_STAGES = ("explore", "self_check", "novelty")
-FIXED_TAIL_STAGES = ("correctness", "lean")
-RESERVED_STAGE_NAMES = set(FIXED_HEAD_STAGES) | set(FIXED_TAIL_STAGES) | {"review", "archive", "intake"}
+# The crosscheck referee gets Bash (+ the venv python) to re-run computations
+# itself and web tools to do a real literature check — but never Write access to
+# anything but its own verdict, and never sight of the source paper's build junk.
+CROSSCHECK_TOOLS = "Read Write Bash WebSearch WebFetch"
 
 
 # Defaults for every optional config.toml key, so a minimal config (or none at
 # all) still runs. config.toml only needs to hold the values you want to
 # override; the essays explaining each key live in DOCS.md, not here.
 CONFIG_DEFAULTS = {
-    "author": "Starter",
-    "generator_model": "sonnet",
-    "self_check_model": "sonnet",
-    "taste_model": "sonnet",
-    "referee_model": "sonnet",
-    "gates": [{"name": "taste", "on_fail": "archive", "calibration": True}],
-    "max_runs_per_day": 5,
+    "referee_model": "opus",       # crosscheck + rank; opus catches more errors
+    "max_runs_per_day": 10,
     "max_usd_per_run": 10.0,
     "max_usd_per_paper": 0,
-    "max_explore_attempts": 2,
-    "max_self_check_attempts": 2,
     "max_referee_attempts": 2,
-    "stage_timeout_seconds": 1800,
-    "explore_timeout_seconds": 3600,
+    "stage_timeout_seconds": 3600,
     "claude_extra_args": ["--strict-mcp-config"],
     "notify": True,
     "lean_enabled": True,
@@ -117,7 +104,7 @@ def load_dotenv(path=None):
     (ANTHROPIC_API_KEY, ARISTOTLE_API_KEY) don't depend on shell profiles —
     cron/launchd invocations see them too. Variables already set in the real
     environment always win. Corollary: to run on Claude subscription auth,
-    the key must be absent from BOTH the shell environment and .env —
+    ANTHROPIC_API_KEY must be absent from BOTH the shell environment and .env —
     `env -u ANTHROPIC_API_KEY` alone can't unset what .env then re-adds."""
     path = path or (ROOT / ".env")
     if not path.exists():
@@ -147,10 +134,9 @@ def now():
 def init_state(paper_ref):
     return {
         "paper": paper_ref,
-        "stage": "explore",
-        "attempts": {"explore": 0, "self_check": 0},
-        "feedback": None,
-        "history": [{"stage": "intake", "at": now(), "note": f"created for {paper_ref}"}],
+        "stage": "crosscheck",
+        "attempts": {},
+        "history": [{"stage": "intake", "at": now(), "note": f"ingested {paper_ref}"}],
     }
 
 
@@ -167,14 +153,26 @@ def append_history(state, stage, note):
 
 
 # --- intake ----------------------------------------------------------------
+# A GPT project folder is any immediate subdirectory of inbox/ that contains
+# note.tex + result.json (the artifacts GPT-PROMPT.md is told to emit). We copy
+# it into runs/<slug>/, fetch the source paper it responds to (so the crosscheck
+# referee can judge novelty and motivation), and set it going at crosscheck.
 
-def slugify_arxiv(arxiv_id):
-    return "arxiv-" + arxiv_id.replace("/", "-")
+def slugify_folder(name):
+    base = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-").lower()
+    return base or "project"
 
 
-def slugify_pdf(path):
-    base = re.sub(r"[^a-zA-Z0-9_-]+", "-", path.stem).strip("-").lower()
-    return f"pdf-{base}"
+ARXIV_RE = re.compile(r"(\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?/\d{7})")
+
+
+def arxiv_id_from_paper_ref(paper_ref):
+    """Pull an arXiv id out of result.json's "paper" field (e.g. "arxiv:2505.11846"),
+    so intake can fetch the source paper for the referee. None if it isn't an arXiv ref."""
+    if not isinstance(paper_ref, str):
+        return None
+    m = ARXIV_RE.search(paper_ref)
+    return m.group(1) if m else None
 
 
 def fetch_arxiv_source(arxiv_id, dest_dir):
@@ -206,11 +204,11 @@ def fetch_arxiv_source(arxiv_id, dest_dir):
 
 
 # Files arXiv source tarballs carry that cost real tokens but hold no
-# mathematical content the generator needs: .sty/.cls/.bst are camera-ready
-# LaTeX rendering machinery, .bib/.bbl is bibliography data (the novelty stage
-# does its own citation search), aux/build residue is compiler bookkeeping,
-# and figures are images the model can only burn vision tokens on, not read
-# for content it can't already get from the surrounding .tex prose/captions.
+# mathematical content the referee needs: .sty/.cls/.bst are camera-ready
+# LaTeX rendering machinery, .bib/.bbl is bibliography data (the crosscheck does
+# its own citation search), aux/build residue is compiler bookkeeping, and
+# figures are images the model can only burn vision tokens on, not read for
+# content it can't already get from the surrounding .tex prose/captions.
 PAPER_SOURCE_STRIP_EXTS = {
     ".sty", ".cls", ".bst",
     ".bib", ".bbl", ".blg",
@@ -257,60 +255,27 @@ def prune_paper_dir(paper_dir):
     return removed
 
 
-def intake_arxiv(arxiv_id):
-    """Create a run for an arXiv ID. Returns True iff a new run was created."""
-    slug = slugify_arxiv(arxiv_id)
-    run_dir = ROOT / "runs" / slug
-    if run_dir.exists() or (ROOT / "review" / slug).exists() or (ROOT / "archive" / slug).exists():
-        print(f"[intake] {slug} already exists, skipping")
-        return False
-    run_dir.mkdir(parents=True)
+def fetch_paper_for(run_dir, paper_ref):
+    """Best-effort: put the source paper the note responds to under paper/ so the
+    crosscheck referee can check novelty and motivation. A note whose paper we
+    can't fetch is still refereed (correctness from the note alone, novelty via
+    web search) — so any failure here is logged, never fatal."""
+    if (run_dir / "paper").exists():
+        return  # GPT already shipped the paper alongside the note
+    arxiv_id = arxiv_id_from_paper_ref(paper_ref)
+    if not arxiv_id:
+        print(f"[intake] {run_dir.name}: no arXiv id in result.json 'paper' field; refereeing without the source paper")
+        return
     paper_dir = run_dir / "paper"
     paper_dir.mkdir()
     try:
         fetch_arxiv_source(arxiv_id, paper_dir)
     except Exception as e:
-        shutil.rmtree(run_dir)
-        print(f"[intake] failed to fetch {arxiv_id}: {e}")
-        return False
-    removed = prune_paper_dir(paper_dir)
-    if removed:
-        print(f"[intake] pruned {len(removed)} non-content file(s) from paper/: {', '.join(str(p) for p in removed)}")
-    saved = strip_tex_comments(paper_dir)
-    if saved:
-        print(f"[intake] stripped {saved} bytes of TeX comments from paper/")
-    save_state(run_dir, init_state(f"arxiv:{arxiv_id}"))
-    print(f"[intake] created run {slug}")
-    return True
-
-
-def intake_pdf(pdf_path):
-    """Create a run for a local PDF. Returns True iff a new run was created."""
-    slug = slugify_pdf(pdf_path)
-    run_dir = ROOT / "runs" / slug
-    if run_dir.exists() or (ROOT / "review" / slug).exists() or (ROOT / "archive" / slug).exists():
-        print(f"[intake] {slug} already exists, skipping")
-        return False
-    if shutil.which("pdftotext") is None:
-        print(f"[intake] cannot ingest {pdf_path.name}: pdftotext not installed (brew install poppler)")
-        return False
-    run_dir.mkdir(parents=True)
-    paper_dir = run_dir / "paper"
-    paper_dir.mkdir()
-    # Keep the original PDF outside paper/ so the generator's "read everything
-    # under ./paper/" only ever sees the text extraction, never re-renders the
-    # original PDF page images (a real, easy-to-hit token/vision cost).
-    dest_pdf = run_dir / pdf_path.name
-    shutil.copy(pdf_path, dest_pdf)
-    proc = subprocess.run(
-        ["pdftotext", str(dest_pdf), str(paper_dir / "paper.txt")],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        print(f"[intake] pdftotext failed for {pdf_path.name}: {proc.stderr}")
-    save_state(run_dir, init_state(f"pdf:{pdf_path.name}"))
-    print(f"[intake] created run {slug}")
-    return True
+        shutil.rmtree(paper_dir, ignore_errors=True)
+        print(f"[intake] {run_dir.name}: could not fetch source paper {arxiv_id} ({e}); refereeing without it")
+        return
+    prune_paper_dir(paper_dir)
+    strip_tex_comments(paper_dir)
 
 
 def runs_created_today():
@@ -333,6 +298,30 @@ def runs_created_today():
     return count
 
 
+def intake_folder(folder):
+    """Ingest one GPT project folder. Returns True iff a new run was created."""
+    if not (folder / "note.tex").exists() or not (folder / "result.json").exists():
+        print(f"[intake] {folder.name}: not a project folder (missing note.tex or result.json), skipping")
+        return False
+    valid, err = validate_result_json(folder / "result.json")
+    if not valid:
+        print(f"[intake] {folder.name}: result.json invalid ({err}), skipping")
+        return False
+
+    slug = slugify_folder(folder.name)
+    if (ROOT / "runs" / slug).exists() or (ROOT / "review" / slug).exists() or (ROOT / "archive" / slug).exists():
+        print(f"[intake] {slug} already exists, skipping")
+        return False
+
+    run_dir = ROOT / "runs" / slug
+    shutil.copytree(folder, run_dir)
+    paper_ref = json.loads((folder / "result.json").read_text()).get("paper", "unknown")
+    fetch_paper_for(run_dir, paper_ref)
+    save_state(run_dir, init_state(paper_ref))
+    print(f"[intake] created run {slug} (paper: {paper_ref})")
+    return True
+
+
 def intake(cfg):
     inbox = ROOT / "inbox"
     processed = inbox / ".processed"
@@ -340,36 +329,22 @@ def intake(cfg):
     quota = cfg.get("max_runs_per_day", 0)
     remaining = max(0, quota - runs_created_today()) if quota else None
 
-    for f in sorted(inbox.iterdir()):
-        if f.is_dir() or f.name.startswith("."):
+    for child in sorted(inbox.iterdir()):
+        if child.name.startswith("."):
             continue
-        if f.suffix == ".pdf":
-            if remaining == 0:
-                print(f"[intake] max_runs_per_day reached; leaving {f.name} in inbox")
-                continue
-            if shutil.which("pdftotext") is None:
-                print(f"[intake] leaving {f.name} in inbox: pdftotext not installed (brew install poppler)")
-                continue
-            if intake_pdf(f) and remaining is not None:
-                remaining -= 1
-            shutil.move(str(f), str(processed / f.name))
-        elif f.suffix == ".txt":
-            ids = [
-                line.strip() for line in f.read_text().splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            ]
-            leftover = []
-            for i, arxiv_id in enumerate(ids):
-                if remaining == 0:
-                    leftover = ids[i:]
-                    break
-                if intake_arxiv(arxiv_id) and remaining is not None:
-                    remaining -= 1
-            if leftover:
-                f.write_text("\n".join(leftover) + "\n")
-                print(f"[intake] max_runs_per_day reached; {len(leftover)} id(s) left queued in {f.name}")
-            else:
-                shutil.move(str(f), str(processed / f.name))
+        if not child.is_dir():
+            print(f"[intake] ignoring {child.name}: drop GPT project folders (a dir with note.tex + result.json) in inbox/, not loose files")
+            continue
+        if remaining == 0:
+            print(f"[intake] max_runs_per_day reached; leaving {child.name} in inbox")
+            continue
+        created = intake_folder(child)
+        # Move the source folder aside whether or not it produced a run (a
+        # malformed folder shouldn't be re-scanned every invocation); a fresh
+        # drop with the same name after fixing it still gets a new slug check.
+        shutil.move(str(child), str(processed / child.name))
+        if created and remaining is not None:
+            remaining -= 1
 
 
 # --- claude invocation -------------------------------------------------------
@@ -384,11 +359,11 @@ def run_claude(run_dir, prompt, model, allowed_tools, cfg, timeout_s=None):
     ]
     # --strict-mcp-config (default via claude_extra_args) keeps the operator's
     # personal MCP servers out of pipeline calls: they cost tokens in every
-    # invocation and would hand the generator/referees tools they must not have.
+    # invocation and would hand the referee tools it must not have.
     cmd += list(cfg.get("claude_extra_args", []))
     if cfg.get("max_usd_per_run", 0):
         cmd += ["--max-budget-usd", str(cfg["max_usd_per_run"])]
-    timeout = timeout_s or cfg.get("stage_timeout_seconds", 1800)
+    timeout = timeout_s or cfg.get("stage_timeout_seconds", 3600)
     env = os.environ.copy()
     # Hard guard against backgrounded computations (prompt-level prohibition
     # alone has failed in practice: a real run died with "Background tasks
@@ -447,18 +422,18 @@ def defer_stage(run_dir, state, stage, log):
 
 
 # --- referee isolation -------------------------------------------------------
-# Verifier independence (design principle 3): referees must not see the
-# generator's reasoning or confidence, only the finished artifact. We enforce
-# this with the filesystem, not just instructions: each referee stage gets its
-# own subdirectory containing only what it's allowed to see, and Claude Code's
+# The crosscheck referee must judge the finished note, not GPT's own confidence
+# in it. We enforce this with the filesystem, not just instructions: the referee
+# gets its own subdirectory containing only what it's allowed to see (paper/ +
+# note.tex + a result.json stripped to id/label/statement), and Claude Code's
 # tool sandboxing means Read/Write/Bash inside that cwd cannot reach files
-# outside it (no --add-dir is granted, so paper/, self_check/, prior referee/
-# reports etc. are simply not visible).
+# outside it (no --add-dir is granted, so GPT's proof_status, audit_notes and
+# verification_report.md are simply not visible).
 
 def strip_result_for_referee(result_path, dest_path):
     data = json.loads(result_path.read_text())
     stripped = {
-        "paper": data["paper"],
+        "paper": data.get("paper", "unknown"),
         "claims": [
             {"id": c["id"], "label": c["label"], "statement": c["statement"]}
             for c in data["claims"]
@@ -472,23 +447,11 @@ def make_referee_dir(run_dir, name, include_paper):
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir()
-    if include_paper:
+    if include_paper and (run_dir / "paper").exists():
         shutil.copytree(run_dir / "paper", dest / "paper")
     shutil.copy(run_dir / "note.tex", dest / "note.tex")
     strip_result_for_referee(run_dir / "result.json", dest / "result.json")
     return dest
-
-
-def build_taste_calibration():
-    parts = []
-    for verdict, dirname in (("ACCEPTED", "accepted"), ("REJECTED", "rejected")):
-        d = ROOT / "taste" / dirname
-        examples = sorted(p for p in d.iterdir() if p.is_file() and not p.name.startswith(".")) if d.exists() else []
-        for p in examples:
-            parts.append(f"### Past {verdict} example ({p.name})\n\n{p.read_text()}\n")
-    if not parts:
-        return "\n\n(No calibration examples yet — use your own judgment applying the criteria above.)\n"
-    return "\n\n## Calibration: this user's past judgments\n\n" + "\n".join(parts)
 
 
 # --- validation --------------------------------------------------------------
@@ -518,12 +481,14 @@ def validate_result_json(path):
     if "claims" not in data or not isinstance(data["claims"], list) or not data["claims"]:
         return False, "missing or empty 'claims' list"
     for c in data["claims"]:
-        for key in ("id", "label", "statement", "proof_status"):
+        for key in ("id", "label", "statement"):
             if key not in c:
                 return False, f"claim missing '{key}': {c}"
         if c["label"] not in VALID_LABELS:
             return False, f"invalid label '{c['label']}' in {c.get('id')}"
-        if c["proof_status"] not in VALID_STATUS:
+        # proof_status is GPT's own self-assessment; accept it when present and
+        # well-formed, but don't require it (the crosscheck forms its own view).
+        if "proof_status" in c and c["proof_status"] not in VALID_STATUS:
             return False, f"invalid proof_status '{c['proof_status']}' in {c.get('id')}"
     return True, None
 
@@ -540,39 +505,6 @@ def load_verdict(path):
 
 
 # --- stage transitions ---------------------------------------------------
-
-def fail_or_archive(run_dir, state, stage_name, reason, cfg):
-    """Retry the same stage, or archive if attempts are exhausted."""
-    max_attempts = cfg[f"max_{stage_name}_attempts"]
-    if state["attempts"][stage_name] < max_attempts:
-        state["feedback"] = reason
-        append_history(state, stage_name, f"attempt failed, retrying: {reason}")
-        save_state(run_dir, state)
-        return True
-    state["stage"] = "archive"
-    state["rejection_reason"] = reason
-    append_history(state, stage_name, f"attempt failed, retries exhausted: {reason}")
-    save_state(run_dir, state)
-    finalize(run_dir, state, cfg)
-    return True
-
-
-def fail_to_explore_or_archive(run_dir, state, stage, reason, cfg):
-    """A real but recoverable finding (gap, counterexample, partially-known
-    results) sends the run back to explore, or archives if explore is out of attempts."""
-    if state["attempts"]["explore"] < cfg["max_explore_attempts"]:
-        state["stage"] = "explore"
-        state["feedback"] = reason
-        append_history(state, stage, f"failed, sending back to explore: {reason}")
-        save_state(run_dir, state)
-        return True
-    state["stage"] = "archive"
-    state["rejection_reason"] = reason
-    append_history(state, stage, f"failed and explore retries exhausted: {reason}")
-    save_state(run_dir, state)
-    finalize(run_dir, state, cfg)
-    return True
-
 
 def referee_stage_error(run_dir, state, stage, reason, cfg):
     """A referee stage failed operationally (invocation error, missing or
@@ -602,383 +534,93 @@ def reject(run_dir, state, stage, reason, note, cfg):
     return True
 
 
-def explore_artifacts_fresh(run_dir, started_at):
-    """True if note.tex and result.json both exist and were (re)written by the
-    invocation that started at started_at — i.e. they are that invocation's own
-    output, not stale leftovers from a previous explore attempt. Used to
-    salvage a run whose invocation died (timeout, dropped connection) AFTER
-    finishing its actual work: the lint gates, not the exit code, decide."""
-    try:
-        return all((run_dir / name).stat().st_mtime >= started_at for name in ("note.tex", "result.json"))
-    except FileNotFoundError:
-        return False
+# --- crosscheck: the one referee stage -----------------------------------
+# GPT wrote the note; a DIFFERENT model referees it here, so this single
+# isolated pass is genuine independent verification (not the same-model
+# self-review GPT-PROMPT.md itself warns can't be trusted). It folds the three
+# checks that matter into one verdict.json:
+#   correctness  re-derive every theorem-complete-proof claim from the note's
+#                own definitions, and re-run computations with Bash.
+#   novelty      a real literature check per substantive claim.
+#   taste        is this worth the user's reading time at all?
+# The referee's overall verdict decides pass/fail, but with a hard safety net:
+# no note passes while a load-bearing proof is anything but "correct", or while
+# every substantive claim is already "known". Those are the false positives that
+# waste the user's time, so code enforces them regardless of the verdict field.
 
-
-def format_feedback(feedback, limit=4000):
-    """Feedback fed back into a generator prompt. Substantive feedback (gaps,
-    novelty breakdowns) is model-written and short; operational failures embed
-    the raw CLI JSON blob, which is noise and token cost to the next attempt —
-    keep the head, which carries the actual error."""
-    if len(feedback) <= limit:
-        return feedback
-    return feedback[:limit] + "\n[... truncated: full detail in state.json history ...]"
-
-
-def do_explore(run_dir, state, cfg):
-    attempts = state["attempts"]["explore"]
-    prompt_md = (ROOT / "PROMPT.md").read_text()
-    explore_md = (ROOT / "prompts" / "explore.md").read_text()
-    explore_md = explore_md.replace("{{VENV_PYTHON}}", str(ROOT / cfg["venv_python"]))
-    explore_md = explore_md.replace("{{AUTHOR}}", cfg.get("author", "Starter"))
-    prompt = prompt_md + "\n\n" + explore_md
-    if state.get("feedback"):
-        prompt += f"\n\n---\n\nA previous attempt failed. Fix this and try again:\n\n{format_feedback(state['feedback'])}\n"
-
-    started_at = time.time()
-    ok, log = run_claude(run_dir, prompt, cfg["generator_model"], EXPLORE_TOOLS, cfg,
-                         timeout_s=cfg.get("explore_timeout_seconds"))
-    (run_dir / f"explore_attempt_{attempts + 1}.log").write_text(log)
-    track_cost(state, log)
-    if not ok:
-        # Salvage before anything else: an invocation can die (wall-clock
-        # timeout, connection dropped mid-response) after having already
-        # written a complete note. If the artifacts are its own fresh output,
-        # let the lint gates below judge them instead of discarding the work.
-        if explore_artifacts_fresh(run_dir, started_at):
-            append_history(state, "explore", "invocation reported failure but left freshly written note.tex + result.json; salvaging and applying the normal lint gates")
-            ok = True
-        elif is_transient_failure(log):
-            return defer_stage(run_dir, state, "explore", log)
-    state["attempts"]["explore"] = attempts + 1
-
-    if not ok:
-        return fail_or_archive(run_dir, state, "explore", f"claude invocation failed:\n{log}", cfg)
-
-    if not (run_dir / "note.tex").exists() or not (run_dir / "result.json").exists():
-        return fail_or_archive(run_dir, state, "explore", "Model did not produce both note.tex and result.json.", cfg)
-
+def do_crosscheck(run_dir, state, cfg):
+    # Compile for the reader's note.pdf and as a lint. A note that doesn't
+    # compile is a defect worth flagging, but the referee reads the .tex source
+    # regardless, so don't abort the run over it — record and continue.
     compile_ok, compile_err = compile_latex(run_dir)
     if not compile_ok:
-        return fail_or_archive(run_dir, state, "explore", f"latex compile failed:\n{compile_err}", cfg)
+        state["compile_failed"] = True
+        append_history(state, "crosscheck", "note.tex does not compile (refereeing the source anyway)")
 
-    valid, err = validate_result_json(run_dir / "result.json")
-    if not valid:
-        return fail_or_archive(run_dir, state, "explore", f"result.json invalid: {err}", cfg)
-
-    state["stage"] = "self_check"
-    state["feedback"] = None
-    append_history(state, "explore", "passed lint (latex compiles, result.json valid)")
-    save_state(run_dir, state)
-    return True
-
-
-def do_self_check(run_dir, state, cfg):
-    attempts = state["attempts"]["self_check"]
-    self_check_md = (ROOT / "prompts" / "self_check.md").read_text()
-    self_check_md = self_check_md.replace("{{VENV_PYTHON}}", str(ROOT / cfg["venv_python"]))
-
-    ok, log = run_claude(run_dir, self_check_md, cfg["self_check_model"], GENERATOR_TOOLS, cfg)
-    (run_dir / f"self_check_attempt_{attempts + 1}.log").write_text(log)
-    track_cost(state, log)
-    if not ok and is_transient_failure(log):
-        return defer_stage(run_dir, state, "self_check", log)
-    state["attempts"]["self_check"] = attempts + 1
-
-    if not ok:
-        # An invocation failure is the checker's problem, not the note's:
-        # retry self_check itself rather than re-running the expensive
-        # explore stage.
-        return fail_or_archive(run_dir, state, "self_check", f"self-check invocation failed:\n{log}", cfg)
-
-    valid, err = validate_result_json(run_dir / "result.json")
-    if not valid:
-        return fail_to_explore_or_archive(run_dir, state, "self_check", f"self-check left result.json invalid: {err}", cfg)
-
-    claims = json.loads((run_dir / "result.json").read_text())["claims"]
-    bad = [
-        c for c in claims
-        if c["label"] == "theorem-complete-proof" and c["proof_status"] in ("gap-found", "counterexample-found")
-    ]
-    if bad:
-        details = "\n".join(f"- {c['id']}: {c['proof_status']} — {c.get('self_check_notes', '')}" for c in bad)
-        return fail_to_explore_or_archive(run_dir, state, "self_check", f"Self-check found problems:\n{details}", cfg)
-
-    append_history(state, "self_check", "passed: no theorem-complete-proof claim has a gap or counterexample")
-    apply_self_check_fixes(run_dir, state, cfg)
-    state["stage"] = "novelty"
-    save_state(run_dir, state)
-    return True
-
-
-def claim_skeleton(result_text):
-    """The structural fields of result.json that gates key off — a repair pass
-    must leave these untouched (it may only reword statements/prose)."""
-    data = json.loads(result_text)
-    return [(c.get("id"), c.get("label"), c.get("proof_status")) for c in data.get("claims", [])]
-
-
-def apply_self_check_fixes(run_dir, state, cfg):
-    """Self-check may leave self_check/fixes.md: concrete minor defects that
-    are not gaps in load-bearing proofs (prose contradicting the note's own
-    table, a mislabeled script output) and so don't justify a full explore
-    rerun — but would otherwise reach the correctness referee, whose verdict
-    on them triggers exactly that expensive loop. Apply them with one cheap
-    invocation before any referee sees the note. Best-effort: any failure
-    restores the pre-repair files and the run proceeds with the original note."""
-    fixes = run_dir / "self_check" / "fixes.md"
-    if not fixes.exists():
-        return
-    attempt = state["attempts"].get("repair", 0) + 1
-    state["attempts"]["repair"] = attempt
-    backups = {name: (run_dir / name).read_text() for name in ("note.tex", "result.json")}
-    skeleton_before = claim_skeleton(backups["result.json"])
-
-    prompt = (ROOT / "prompts" / "repair.md").read_text()
-    ok, log = run_claude(run_dir, prompt, cfg["self_check_model"], REPAIR_TOOLS, cfg)
-    (run_dir / f"repair_attempt_{attempt}.log").write_text(log)
-    track_cost(state, log)
-
-    err = None
-    if not ok:
-        err = "repair invocation failed"
-    else:
-        compile_ok, compile_err = compile_latex(run_dir)
-        if not compile_ok:
-            err = f"repaired note.tex does not compile: {compile_err}"
-        else:
-            valid, verr = validate_result_json(run_dir / "result.json")
-            if not valid:
-                err = f"repair left result.json invalid: {verr}"
-            elif claim_skeleton((run_dir / "result.json").read_text()) != skeleton_before:
-                err = "repair changed claim ids/labels/proof_status (only statements may be reworded)"
-
-    if err:
-        for name, text in backups.items():
-            (run_dir / name).write_text(text)
-        fixes.rename(fixes.with_name("fixes.failed.md"))
-        append_history(state, "self_check", f"repair pass failed, proceeding with unrepaired note: {err}")
-        print(f"[self_check] repair pass failed on {run_dir.name}; proceeding with unrepaired note")
-        return
-    fixes.rename(fixes.with_name("fixes.applied.md"))
-    append_history(state, "self_check", "repair pass applied self_check/fixes.md")
-
-
-def gate_specs(cfg):
-    """User-defined pass/fail referee gates (config.toml `[[gates]]`), run in
-    config order between novelty and correctness. Each is a dict with a required
-    `name` and optional `prompt`, `on_fail`, `include_paper`, `tools`, `model`,
-    `calibration` (see do_gate for the contract)."""
-    return cfg.get("gates", []) or []
-
-
-def stage_sequence(cfg):
-    """The full ordered stage list for this config, gates spliced in by name."""
-    return list(FIXED_HEAD_STAGES) + [g["name"] for g in gate_specs(cfg)] + list(FIXED_TAIL_STAGES)
-
-
-def next_stage(cfg, current):
-    """The stage a passing `current` advances to. Used by novelty and the gates
-    so the sequence stays data-driven: renaming/reordering/removing a gate in
-    config.toml just works, no transition edits needed."""
-    seq = stage_sequence(cfg)
-    i = seq.index(current)
-    return seq[i + 1] if i + 1 < len(seq) else "review"
-
-
-def validate_gate_config(cfg):
-    """Fail fast at startup on a malformed `[[gates]]` table rather than deep in
-    a run: every gate needs a unique, non-reserved name and an existing prompt."""
-    seen = set()
-    for gate in gate_specs(cfg):
-        name = gate.get("name")
-        if not name or not isinstance(name, str):
-            raise SystemExit(f"[[gates]] entry missing a string 'name': {gate!r}")
-        if name in RESERVED_STAGE_NAMES:
-            raise SystemExit(f"gate name {name!r} collides with a built-in stage; pick another")
-        if name in seen:
-            raise SystemExit(f"duplicate gate name {name!r} in config.toml")
-        seen.add(name)
-        prompt = ROOT / "prompts" / gate.get("prompt", f"{name}.md")
-        if not prompt.exists():
-            raise SystemExit(f"gate {name!r} references missing prompt file {prompt}")
-        if gate.get("on_fail", "archive") not in ("archive", "explore"):
-            raise SystemExit(f"gate {name!r} has invalid on_fail {gate.get('on_fail')!r} (expected 'archive' or 'explore')")
-
-
-def do_gate(run_dir, state, cfg, gate):
-    """A generic pass/fail referee gate — the shape shared by taste and any
-    user-added gate. Runs one isolated `claude -p` over paper+note and reads a
-    `verdict.json` of the form {"verdict": "pass"|"fail", "notes": "...",
-    "scores": {...}}. On pass -> next stage; on fail -> archive (or back to
-    explore if the gate sets on_fail = "explore"). Operational/transient
-    failures are handled exactly as the built-in referee stages."""
-    name = gate["name"]
     (run_dir / "referee").mkdir(exist_ok=True)
-    view_dir = make_referee_dir(run_dir, f"{name}_view", include_paper=gate.get("include_paper", True))
-    prompt = (ROOT / "prompts" / gate.get("prompt", f"{name}.md")).read_text()
-    if gate.get("calibration"):
-        prompt += build_taste_calibration()
-    model = gate.get("model") or cfg.get("referee_model", "sonnet")
-    tools = gate.get("tools", "Read Write")
-    attempt = state["attempts"].get(name, 0) + 1
+    view_dir = make_referee_dir(run_dir, "crosscheck_view", include_paper=True)
+    prompt = (ROOT / "prompts" / "crosscheck.md").read_text()
+    prompt = prompt.replace("{{VENV_PYTHON}}", str(ROOT / cfg["venv_python"]))
+    attempt = state["attempts"].get("crosscheck", 0) + 1
 
-    ok, log = run_claude(view_dir, prompt, model, tools, cfg)
-    (run_dir / f"{name}_attempt_{attempt}.log").write_text(log)
+    ok, log = run_claude(view_dir, prompt, cfg["referee_model"], CROSSCHECK_TOOLS, cfg)
+    (run_dir / f"crosscheck_attempt_{attempt}.log").write_text(log)
     track_cost(state, log)
     if not ok and is_transient_failure(log):
-        return defer_stage(run_dir, state, name, log)
-
+        return defer_stage(run_dir, state, "crosscheck", log)
     if not ok:
-        return referee_stage_error(run_dir, state, name, f"invocation failed:\n{log}", cfg)
+        return referee_stage_error(run_dir, state, "crosscheck", f"invocation failed:\n{log}", cfg)
+
     verdict, err = load_verdict(view_dir / "verdict.json")
     if verdict is None:
-        return referee_stage_error(run_dir, state, name, err, cfg)
-
-    shutil.copy(view_dir / "verdict.json", run_dir / "referee" / f"{name}.json")
+        return referee_stage_error(run_dir, state, "crosscheck", err, cfg)
+    shutil.copy(view_dir / "verdict.json", run_dir / "referee" / "crosscheck.json")
     if (view_dir / "report.md").exists():
-        shutil.copy(view_dir / "report.md", run_dir / "referee" / f"{name}_report.md")
+        shutil.copy(view_dir / "report.md", run_dir / "referee" / "crosscheck_report.md")
 
     if verdict.get("verdict") not in ("pass", "fail"):
-        return referee_stage_error(run_dir, state, name, f"verdict.json has no valid 'verdict' field: {verdict.get('verdict')!r}", cfg)
-    if verdict["verdict"] != "pass":
-        reason = f"{name} gate rejected: {verdict.get('notes', '')}"
+        return referee_stage_error(run_dir, state, "crosscheck",
+                                   f"verdict.json has no valid 'verdict' field: {verdict.get('verdict')!r}", cfg)
+
+    # The referee must return a verdict for every claim it was asked about; a
+    # silently missing load-bearing claim is a malformed verdict, not a pass.
+    claims = json.loads((run_dir / "result.json").read_text())["claims"]
+    load_bearing = [c["id"] for c in claims if c["label"] == "theorem-complete-proof"]
+    substantive = [c["id"] for c in claims if c["label"] in ("theorem-complete-proof", "conjecture-with-evidence")]
+    correctness = {c.get("id"): c for c in verdict.get("correctness", []) if isinstance(c, dict)}
+    novelty = {c.get("id"): c for c in verdict.get("novelty", []) if isinstance(c, dict)}
+
+    for cid in load_bearing:
+        v = correctness.get(cid, {}).get("verdict")
+        if v not in VALID_CORRECTNESS_VERDICTS:
+            return referee_stage_error(run_dir, state, "crosscheck",
+                                       f"verdict.json has no valid correctness verdict for load-bearing claim '{cid}'", cfg)
+
+    # Hard safety net (enforced regardless of the referee's overall verdict).
+    bad_proofs = [(cid, correctness[cid]["verdict"], correctness[cid].get("notes", ""))
+                  for cid in load_bearing if correctness[cid]["verdict"] != "correct"]
+    all_known = bool(substantive) and all(novelty.get(cid, {}).get("novelty_status") == "known" for cid in substantive)
+
+    fail_reasons = []
+    if bad_proofs:
+        fail_reasons.append("Correctness — a proved claim did not survive independent re-derivation:\n"
+                            + "\n".join(f"  - {cid}: {v} — {notes}" for cid, v, notes in bad_proofs))
+    if all_known:
+        known = "\n".join(f"  - {cid}: {novelty.get(cid, {}).get('reference', '')}" for cid in substantive)
+        fail_reasons.append("Novelty — every substantive claim is already in the literature:\n" + known)
+    if verdict["verdict"] == "fail" and verdict.get("notes"):
+        fail_reasons.append(f"Referee verdict: fail — {verdict['notes']}")
+
+    if fail_reasons:
+        reason = "\n\n".join(fail_reasons)
         if verdict.get("scores"):
-            reason += f"\nScores: {verdict.get('scores')}"
-        if gate.get("on_fail") == "explore":
-            return fail_to_explore_or_archive(run_dir, state, name, reason, cfg)
-        return reject(run_dir, state, name, reason, f"archived: failed {name} gate", cfg)
+            reason += f"\n\nTaste scores: {verdict['scores']}"
+        return reject(run_dir, state, "crosscheck", reason, "archived: failed crosscheck", cfg)
 
-    state["stage"] = next_stage(cfg, name)
-    append_history(state, name, f"passed: {verdict.get('scores') or verdict.get('notes', 'ok')}")
-    save_state(run_dir, state)
-    return True
-
-
-def do_novelty(run_dir, state, cfg):
-    (run_dir / "referee").mkdir(exist_ok=True)
-    view_dir = make_referee_dir(run_dir, "novelty_view", include_paper=True)
-    prompt = (ROOT / "prompts" / "novelty.md").read_text()
-    attempt = state["attempts"].get("novelty", 0) + 1
-
-    ok, log = run_claude(view_dir, prompt, cfg["taste_model"], "Read Write WebSearch WebFetch", cfg)
-    (run_dir / f"novelty_attempt_{attempt}.log").write_text(log)
-    track_cost(state, log)
-    if not ok and is_transient_failure(log):
-        return defer_stage(run_dir, state, "novelty", log)
-
-    if not ok:
-        return referee_stage_error(run_dir, state, "novelty", f"invocation failed:\n{log}", cfg)
-    verdict, err = load_verdict(view_dir / "verdict.json")
-    if verdict is None:
-        return referee_stage_error(run_dir, state, "novelty", err, cfg)
-
-    shutil.copy(view_dir / "verdict.json", run_dir / "referee" / "novelty.json")
-    if (view_dir / "report.md").exists():
-        shutil.copy(view_dir / "report.md", run_dir / "referee" / "novelty_report.md")
-
-    # The referee must return a status for every claim it was asked to check;
-    # a silently missing claim is a malformed verdict, not a pass.
-    result_claims = json.loads((run_dir / "result.json").read_text())["claims"]
-    required_ids = {
-        c["id"] for c in result_claims
-        if c["label"] in ("theorem-complete-proof", "conjecture-with-evidence")
-    }
-    verdict_claims = verdict.get("claims")
-    if not isinstance(verdict_claims, list):
-        return referee_stage_error(run_dir, state, "novelty", "verdict.json has no 'claims' list", cfg)
-    covered = {c.get("id") for c in verdict_claims}
-    missing = required_ids - covered
-    if missing:
-        return referee_stage_error(run_dir, state, "novelty", f"verdict.json missing claim(s): {sorted(missing)}", cfg)
-
-    known = [c for c in verdict_claims if c.get("novelty_status") == "known"]
-    if known:
-        details = "\n".join(f"- {c.get('id')}: known — {c.get('reference', '')}" for c in known)
-        surviving = [c for c in verdict_claims if c.get("novelty_status") != "known"]
-        # A run whose main result is known but whose other claims survived the
-        # literature check still has salvageable content: send it back to
-        # explore to be rebuilt around the surviving claims rather than
-        # discarding the novel work along with the rediscovery. Archive only
-        # when nothing substantive survived.
-        if surviving:
-            statuses = "\n".join(f"- {c.get('id')}: {c.get('novelty_status')}" for c in surviving)
-            feedback = (
-                f"The novelty referee found that some claims are already in the literature:\n{details}\n\n"
-                f"These claims survived the literature check:\n{statuses}\n\n"
-                "Rewrite the note around the surviving claims: demote each known result to cited background "
-                "(using the references above), make the strongest surviving claim the main result, and try to "
-                "strengthen or extend it now that the known material is settled context rather than the goal. "
-                "The full novelty report is in ./referee/novelty_report.md."
-            )
-            return fail_to_explore_or_archive(run_dir, state, "novelty", feedback, cfg)
-        return reject(run_dir, state, "novelty",
-                      f"Novelty check found prior work for every substantive claim:\n{details}",
-                      "archived: all substantive claims already known", cfg)
-
-    state["stage"] = next_stage(cfg, "novelty")
-    append_history(state, "novelty", "passed: no claim found in prior literature")
-    save_state(run_dir, state)
-    return True
-
-
-def do_correctness(run_dir, state, cfg):
-    (run_dir / "referee").mkdir(exist_ok=True)
-    view_dir = make_referee_dir(run_dir, "correctness_view", include_paper=False)
-    prompt = (ROOT / "prompts" / "correctness_referee.md").read_text()
-
-    result_claims = json.loads((run_dir / "result.json").read_text())["claims"]
-    load_bearing_ids = {c["id"] for c in result_claims if c["label"] == "theorem-complete-proof"}
-
-    passes = []
-    for i in (1, 2):
-        for f in ("verdict.json", "report.md"):
-            p = view_dir / f
-            if p.exists():
-                p.unlink()
-        ok, log = run_claude(view_dir, prompt, cfg["referee_model"], "Read Write", cfg)
-        (run_dir / f"correctness_pass{i}.log").write_text(log)
-        track_cost(state, log)
-        if not ok and is_transient_failure(log):
-            return defer_stage(run_dir, state, "correctness", log)
-        if not ok:
-            return referee_stage_error(run_dir, state, "correctness", f"pass {i} invocation failed:\n{log}", cfg)
-        verdict, err = load_verdict(view_dir / "verdict.json")
-        if verdict is None:
-            return referee_stage_error(run_dir, state, "correctness", f"pass {i}: {err}", cfg)
-        shutil.copy(view_dir / "verdict.json", run_dir / "referee" / f"correctness_pass{i}.json")
-        if (view_dir / "report.md").exists():
-            shutil.copy(view_dir / "report.md", run_dir / "referee" / f"correctness_pass{i}_report.md")
-        passes.append(verdict)
-
-    # Every load-bearing claim must receive an explicit, valid verdict in BOTH
-    # passes. A pass whose verdict.json omits a claim (or garbles a verdict
-    # value) must not silently count as approval — false positives are the
-    # expensive failure mode here.
-    bad = []
-    for i, res in enumerate(passes, start=1):
-        claims = res.get("claims") if isinstance(res.get("claims"), list) else []
-        by_id = {c.get("id"): c for c in claims}
-        for cid in sorted(load_bearing_ids):
-            c = by_id.get(cid)
-            if c is None or c.get("verdict") not in VALID_CORRECTNESS_VERDICTS:
-                return referee_stage_error(
-                    run_dir, state, "correctness",
-                    f"pass {i} verdict.json has no valid verdict for load-bearing claim '{cid}'", cfg)
-            if c["verdict"] != "correct":
-                bad.append((i, cid, c["verdict"], c.get("notes", "")))
-
-    if bad:
-        reason = "\n".join(f"- pass {i}/{cid}: {v} — {notes}" for i, cid, v, notes in bad)
-        if all(v == "fixable-gap" for _, _, v, _ in bad):
-            return fail_to_explore_or_archive(run_dir, state, "correctness", f"Correctness referee found fixable gaps:\n{reason}", cfg)
-        return reject(run_dir, state, "correctness",
-                      f"Correctness referee found unrecoverable issues:\n{reason}",
-                      "archived: wrong/cannot-verify verdict", cfg)
-
-    append_history(state, "correctness", "passed: both independent passes verified all load-bearing claims")
+    append_history(state, "crosscheck", f"passed: {verdict.get('scores') or verdict.get('notes', 'ok')}")
     if lean_enabled(cfg):
         state["stage"] = "lean"
-        append_history(state, "correctness", "entering lean formalization track (bonus evidence, non-gating)")
+        append_history(state, "crosscheck", "entering lean formalization track (bonus evidence, non-gating)")
         save_state(run_dir, state)
         return True
     state["stage"] = "review"
@@ -988,18 +630,21 @@ def do_correctness(run_dir, state, cfg):
 
 
 # --- lean track (Aristotle) ----------------------------------------------------
-# Stage 5b: Lean 4 formalization as BONUS EVIDENCE, never a gate. The run has
-# already passed both gates when it arrives here, so no Aristotle outcome may
-# demote it — the only exit is review. Aristotle (Harmonic's cloud prover,
-# free: no Anthropic tokens) can take hours per claim, so submissions are
-# asynchronous (`aristotle formalize` WITHOUT --wait): the run sits at this
-# stage across orchestrator invocations, and each tick advances whatever it
-# can — submit pending claims, poll running ones, download finished ones —
-# until every claim is resolved or hits lean_timeout_minutes.
+# Lean 4 formalization as BONUS EVIDENCE, never a gate. The run has already
+# passed crosscheck when it arrives here, so no Aristotle outcome may demote it —
+# the only exit is review. Aristotle (Harmonic's cloud prover, free: no Anthropic
+# tokens) can take hours per claim, so submissions are asynchronous (`aristotle
+# formalize` WITHOUT --wait): the run sits at this stage across orchestrator
+# invocations, and each tick advances whatever it can — submit pending claims,
+# poll running ones, download finished ones — until every claim is resolved or
+# hits lean_timeout_minutes.
 
 ARISTOTLE_TERMINAL = {"COMPLETE", "COMPLETE_WITH_ERRORS", "OUT_OF_BUDGET", "FAILED", "CANCELED"}
 ARISTOTLE_STATUSES = ARISTOTLE_TERMINAL | {"QUEUED", "IN_PROGRESS", "UNKNOWN"}
-VALID_FORMALIZATION = {"proof-formalized", "statement-formalized", "not-formalizable"}
+# Note-level formalization outcomes recorded in result.json's "formalization":
+#   proof-formalized      COMPLETE, no sorry, no reported error (machine-checked)
+#   statement-formalized  built the statements but a sorry or error remains
+#   not-formalizable      failed / out-of-budget / timed out
 
 
 def lean_enabled(cfg):
@@ -1034,47 +679,90 @@ def parse_aristotle_task_status(log):
     return None
 
 
-def lean_claim_stem(claim_id):
-    return "claim-" + (re.sub(r"[^a-zA-Z0-9_-]+", "-", claim_id).strip("-") or "unnamed")
+LEAN_DEFAULT_PROMPT = (
+    "Formalise all results in this paper as Lean 4 theorems and prove them. "
+    "State each result faithfully and type-correctly; do not weaken or alter a statement to make a proof easier "
+    "(leave `sorry` on a faithful statement rather than proving a different one). "
+    "If while formalising you find an actual error in one of the paper's proofs, try to fix it, and record what was "
+    "wrong and how you fixed it (or why you couldn't) in a file named ERROR.md at the top of the project."
+)
 
 
-def write_lean_problem(run_dir, lean_dir, claim):
-    """One self-contained problem file per claim: Aristotle's formalize
-    endpoint takes a single file plus the fixed prompt "Formalize <filename>",
-    so the instructions, the statement, and the note (for definitions and
-    notation) all ride inside the file itself."""
-    path = lean_dir / f"{lean_claim_stem(claim['id'])}.tex"
-    path.write_text(
-        "Formalize the claim below as a Lean 4 theorem and prove it. "
-        "Produce a faithful, type-correct statement of exactly this claim; do not weaken or alter it to make the proof easier. "
-        "If a complete proof is out of reach, leave the faithful statement with `sorry` rather than proving a different theorem.\n\n"
-        f"CLAIM ({claim['id']}):\n\n{claim['statement']}\n\n"
-        "CONTEXT — the research note this claim is taken from, for definitions and notation:\n\n"
-        + (run_dir / "note.tex").read_text()
-    )
-    return path
+def read_lean_prompt(cfg):
+    """The instruction sent to `aristotle submit`. Editable as prompts/lean.md
+    (the 'prompts are files' convention) — falls back to LEAN_DEFAULT_PROMPT."""
+    p = ROOT / "prompts" / "lean.md"
+    if p.exists():
+        text = p.read_text().strip()
+        if text:
+            return text
+    return LEAN_DEFAULT_PROMPT
 
 
-def fetch_lean_result(lean_dir, cid, entry):
-    """Download and unpack the finished project's Lean files. Best-effort: the
-    verdict is the task status Aristotle reported; missing files never change it."""
-    stem = lean_claim_stem(cid)
-    tar_path = lean_dir / f"{stem}.result.tar.gz"
+def download_lean_project(lean_dir, entry):
+    """Download and unpack the finished project (a .tar.gz from `aristotle
+    download`) into lean/solution/. Best-effort: the verdict is the task status
+    Aristotle reported; a missing/broken download never changes it."""
+    tar_path = lean_dir / "result.tar.gz"
     run_aristotle(["download", entry["project_id"], "--destination", str(tar_path)])
     if not tar_path.exists():
         entry["download_failed"] = True
-        return
-    dest = lean_dir / stem
-    dest.mkdir(exist_ok=True)
+        return None
+    dest = lean_dir / "solution"
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir()
     try:
         with tarfile.open(tar_path) as tf:
             tf.extractall(dest, filter="data")
         tar_path.unlink()
     except (tarfile.TarError, OSError):
         entry["download_failed"] = True
+        return None
+    return dest
 
 
-def lean_done(run_dir, state, cfg, note):
+def scan_lean_output(dest):
+    """Two best-effort signals from a finished project: an ERROR.md the agent may
+    have written (per the prompt — an actual proof error it found) and the count
+    of remaining `sorry`s in the Lean sources (an incomplete proof). Neither is
+    authoritative; both feed the SUMMARY/ranking, never a gate."""
+    error_text = None
+    sorries = 0
+    for p in dest.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.name.lower() == "error.md" and error_text is None:
+            with contextlib.suppress(OSError):
+                error_text = p.read_text(errors="replace").strip()
+        elif p.suffix == ".lean":
+            with contextlib.suppress(OSError):
+                sorries += len(re.findall(r"\bsorry\b", p.read_text(errors="replace")))
+    return sorries, error_text
+
+
+def lean_finish(run_dir, state, cfg, entry, note):
+    """Record the note-level formalization outcome into result.json, then hand off
+    to review. Called on every terminal Lean path (proved / statement-only /
+    not-formalizable). The status is a fact about the note as a whole — one
+    Aristotle project per note — not per claim."""
+    data = json.loads((run_dir / "result.json").read_text())
+    data["formalization"] = {
+        "status": entry["status"],
+        "aristotle_status": entry.get("aristotle_status"),
+        "sorries": entry.get("sorries"),
+        "error_reported": bool(entry.get("error_reported")),
+        "project_id": entry.get("project_id"),
+    }
+    (run_dir / "result.json").write_text(json.dumps(data, indent=2))
+    state["stage"] = "review"
+    append_history(state, "lean", note)
+    save_state(run_dir, state)
+    finalize(run_dir, state, cfg)
+    return True
+
+
+def lean_skip(run_dir, state, cfg, note):
     state["stage"] = "review"
     append_history(state, "lean", note)
     save_state(run_dir, state)
@@ -1084,127 +772,155 @@ def lean_done(run_dir, state, cfg, note):
 
 def do_lean(run_dir, state, cfg):
     if not lean_enabled(cfg):
-        return lean_done(run_dir, state, cfg, "skipped: lean_enabled=false, aristotle CLI missing, or ARISTOTLE_API_KEY unset")
+        return lean_skip(run_dir, state, cfg, "skipped: lean_enabled=false, aristotle CLI missing, or ARISTOTLE_API_KEY unset")
     claims = json.loads((run_dir / "result.json").read_text())["claims"]
-    targets = {c["id"]: c for c in claims if c["label"] == "theorem-complete-proof"}
-    if not targets:
-        return lean_done(run_dir, state, cfg, "skipped: no theorem-complete-proof claim to formalize")
+    if not any(c["label"] == "theorem-complete-proof" for c in claims):
+        return lean_skip(run_dir, state, cfg, "skipped: no theorem-complete-proof claim to formalize")
 
     lean_dir = run_dir / "lean"
     lean_dir.mkdir(exist_ok=True)
-    entries = state.setdefault("lean", {})
-    for cid in targets:
-        entries.setdefault(cid, {"status": "pending"})
+    entry = state.setdefault("lean", {"status": "pending"})
     timeout_s = cfg.get("lean_timeout_minutes", 240) * 60
-    progressed = False
 
-    for cid, entry in entries.items():
-        if entry["status"] == "pending":
-            problem = write_lean_problem(run_dir, lean_dir, targets[cid])
-            ok, log = run_aristotle(["formalize", str(problem)])
-            m = re.search(r"Project created:\s*(\S+)", log)
-            if m:
-                entry.update({"status": "submitted", "project_id": m.group(1), "submitted_at": time.time()})
-                append_history(state, "lean", f"{cid}: submitted to aristotle (project {m.group(1)})")
-                progressed = True
-            elif "too many requests" in log.lower():
-                # Aristotle's concurrent-task cap, not this claim's fault:
-                # stay pending and resubmit once a slot frees up.
-                pass
-            else:
-                fails = entry["submit_failures"] = entry.get("submit_failures", 0) + 1
-                if fails >= 3:
-                    entry.update({"status": "not-formalizable", "aristotle_status": "submit-failed"})
-                    append_history(state, "lean", f"{cid}: submission failed {fails} times, marking not-formalizable: {log[:500]}")
-                    progressed = True
-        elif entry["status"] == "submitted":
-            ok, log = run_aristotle(["tasks", entry["project_id"], "--limit", "1"])
-            status = parse_aristotle_task_status(log)
-            if status in ARISTOTLE_TERMINAL:
-                entry["aristotle_status"] = status
-                if status in ("COMPLETE", "COMPLETE_WITH_ERRORS"):
-                    # COMPLETE means Aristotle proved the faithful statement;
-                    # COMPLETE_WITH_ERRORS means partial progress — count it
-                    # only as a formalized statement, never as a proof.
-                    entry["status"] = "proof-formalized" if status == "COMPLETE" else "statement-formalized"
-                    fetch_lean_result(lean_dir, cid, entry)
+    # One Aristotle project per note: `aristotle submit "<prompt>" --project-dir`
+    # sends the whole note.tex with our editable natural-language instruction
+    # (prompts/lean.md). Asynchronous — a proof can take hours — so the run sits
+    # here across invocations, submitting then polling then downloading.
+    if entry["status"] == "pending":
+        project_dir = lean_dir / "project"
+        project_dir.mkdir(exist_ok=True)
+        shutil.copy(run_dir / "note.tex", project_dir / "note.tex")
+        ok, log = run_aristotle(["submit", read_lean_prompt(cfg), "--project-dir", str(project_dir)])
+        m = re.search(r"Project created:\s*(\S+)", log)
+        if m:
+            entry.update({"status": "submitted", "project_id": m.group(1), "submitted_at": time.time()})
+            append_history(state, "lean", f"submitted whole note to aristotle (project {m.group(1)}); can take hours")
+            save_state(run_dir, state)
+            print(f"[lean] {run_dir.name}: submitted (project {m.group(1)}); will poll on later invocations")
+            return True
+        if "too many requests" in log.lower():
+            # Aristotle's concurrent-task cap: stay pending, resubmit when a slot frees.
+            print(f"[lean] {run_dir.name}: aristotle at concurrent-task cap; staying pending")
+            return False
+        fails = entry["submit_failures"] = entry.get("submit_failures", 0) + 1
+        if fails >= 3:
+            entry.update({"status": "not-formalizable", "aristotle_status": "submit-failed"})
+            return lean_finish(run_dir, state, cfg, entry, f"submit failed {fails}x, marking not-formalizable: {log[:300]}")
+        save_state(run_dir, state)
+        return False
+
+    if entry["status"] == "submitted":
+        ok, log = run_aristotle(["tasks", entry["project_id"], "--limit", "1"])
+        status = parse_aristotle_task_status(log)
+        if status in ARISTOTLE_TERMINAL:
+            entry["aristotle_status"] = status
+            if status in ("COMPLETE", "COMPLETE_WITH_ERRORS"):
+                dest = download_lean_project(lean_dir, entry)
+                sorries, error_text = scan_lean_output(dest) if dest else (None, None)
+                entry["sorries"] = sorries
+                if error_text:
+                    entry["error_reported"] = True
+                    (lean_dir / "ERROR.md").write_text(error_text)
+                # A real machine-checked proof only when Aristotle reports COMPLETE,
+                # no sorry remains, and it flagged no proof error. Anything else is
+                # at most a formalized statement.
+                if status == "COMPLETE" and not entry.get("error_reported") and (sorries or 0) == 0:
+                    entry["status"] = "proof-formalized"
                 else:
-                    entry["status"] = "not-formalizable"
-                append_history(state, "lean", f"{cid}: aristotle finished {status} -> {entry['status']}")
-                progressed = True
-            elif time.time() - entry.get("submitted_at", 0) > timeout_s:
-                run_aristotle(["cancel", entry["project_id"]])  # best-effort: frees the account's concurrent-task slot
-                entry.update({"status": "not-formalizable", "aristotle_status": "timeout"})
-                append_history(state, "lean", f"{cid}: no result within lean_timeout_minutes ({cfg.get('lean_timeout_minutes', 240)}m), canceled and marked not-formalizable")
-                progressed = True
+                    entry["status"] = "statement-formalized"
+            else:
+                entry["status"] = "not-formalizable"
+            return lean_finish(run_dir, state, cfg, entry, lean_result_note(entry, status))
+        if time.time() - entry.get("submitted_at", 0) > timeout_s:
+            run_aristotle(["cancel", entry["project_id"]])  # best-effort: frees the concurrent-task slot
+            entry.update({"status": "not-formalizable", "aristotle_status": "timeout"})
+            return lean_finish(run_dir, state, cfg, entry,
+                               f"no result within lean_timeout_minutes ({cfg.get('lean_timeout_minutes', 240)}m), canceled and marked not-formalizable")
+        save_state(run_dir, state)
+        print(f"[lean] {run_dir.name}: still {status or 'starting'} with aristotle; will poll on a later invocation")
+        return False
 
-    if all(e["status"] in VALID_FORMALIZATION for e in entries.values()):
-        data = json.loads((run_dir / "result.json").read_text())
-        for c in data["claims"]:
-            if c["id"] in entries:
-                c["formalization"] = entries[c["id"]]["status"]
-        (run_dir / "result.json").write_text(json.dumps(data, indent=2))
-        summary = ", ".join(f"{cid}: {e['status']}" for cid, e in sorted(entries.items()))
-        return lean_done(run_dir, state, cfg, f"lean track finished (non-gating): {summary}")
+    # Defensive: an already-terminal entry (shouldn't re-enter, since lean_finish
+    # moves the run to review) — hand off rather than loop.
+    return lean_finish(run_dir, state, cfg, entry, f"lean already {entry['status']}")
 
-    save_state(run_dir, state)
-    waiting = sum(1 for e in entries.values() if e["status"] in ("pending", "submitted"))
-    print(f"[lean] {run_dir.name}: {waiting} claim(s) still with aristotle; will poll on a later invocation")
-    return progressed
+
+def lean_result_note(entry, aristotle_status):
+    note = f"lean track finished (non-gating): {entry['status']} (aristotle {aristotle_status})"
+    if entry.get("sorries"):
+        note += f", {entry['sorries']} sorry(s) remain"
+    if entry.get("error_reported"):
+        note += " — ⚠️ Aristotle reported a proof error (lean/ERROR.md)"
+    return note
 
 
 # --- finalize ----------------------------------------------------------------
 
-def write_review_summary(dest, state, cfg=None):
-    """Mechanical one-page SUMMARY.md for the user: claims + all gate evidence."""
-    lines = [f"# {dest.name} — passed all gates", ""]
-    lines.append(f"Source paper: {state.get('paper', 'unknown')}. Compiled note: `note.pdf`; full referee reports under `referee/`. Total LLM cost: ${state.get('cost_usd', 0.0):.2f}.")
+def write_review_summary(dest, state):
+    """Mechanical one-page SUMMARY.md for the user: claims + crosscheck evidence."""
+    lines = [f"# {dest.name} — passed crosscheck", ""]
+    lines.append(f"Source paper: {state.get('paper', 'unknown')}. Compiled note: `note.pdf`; full referee report in `referee/crosscheck_report.md`. Total LLM cost: ${state.get('cost_usd', 0.0):.2f}.")
+    if state.get("compile_failed"):
+        lines.append("")
+        lines.append("> ⚠️ note.tex did not compile cleanly — see the crosscheck report; the note was refereed from source.")
     lines.append("")
     try:
-        claims = json.loads((dest / "result.json").read_text())["claims"]
+        data = json.loads((dest / "result.json").read_text())
+        claims = data["claims"]
     except (OSError, json.JSONDecodeError, KeyError):
-        claims = []
+        data, claims = {}, []
+    form = data.get("formalization")
+
+    # Loudest thing first: if Aristotle flagged an actual proof error, the reader
+    # must see it before anything else. (Lean is non-gating, so the note still
+    # passed the crosscheck referee — but this is a second opinion worth checking.)
+    if form and form.get("error_reported"):
+        lines.append("> ⚠️ **Aristotle flagged a possible proof error** while formalizing this note. "
+                     "Read `lean/ERROR.md` before trusting the proofs — the crosscheck referee did not catch this, "
+                     "so it may be a real gap (or a false alarm from the formalizer).")
+        lines.append("")
+
+    try:
+        verdict = json.loads((dest / "referee" / "crosscheck.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        verdict = {}
+    correctness = {c.get("id"): c for c in verdict.get("correctness", []) if isinstance(c, dict)}
+    novelty = {c.get("id"): c for c in verdict.get("novelty", []) if isinstance(c, dict)}
+
     lines.append("## Claims")
     lines.append("")
     for c in claims:
-        lines.append(f"- **{c.get('id')}** ({c.get('label')}, self-check: {c.get('proof_status', '?')}): {c.get('statement')}")
-    lines.append("")
-    lines.append("## Gate evidence")
+        cid = c.get("id")
+        bits = [c.get("label")]
+        if cid in correctness:
+            bits.append(f"correctness: {correctness[cid].get('verdict')}")
+        if cid in novelty:
+            bits.append(f"novelty: {novelty[cid].get('novelty_status')}")
+        lines.append(f"- **{cid}** ({', '.join(str(b) for b in bits)}): {c.get('statement')}")
     lines.append("")
 
-    def read_json(name):
-        try:
-            return json.loads((dest / "referee" / name).read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
+    if verdict.get("scores"):
+        lines.append(f"## Taste\n\nScores: {verdict['scores']}. {verdict.get('notes', '')}")
+        lines.append("")
 
-    novelty = read_json("novelty.json")
-    if novelty:
-        statuses = ", ".join(f"{c.get('id')}: {c.get('novelty_status')}" for c in novelty.get("claims", []))
-        lines.append(f"- **Novelty:** {statuses}")
-    for gate in gate_specs(cfg or {}):
-        g = read_json(f"{gate['name']}.json")
-        if g:
-            detail = g.get("notes", "")
-            if g.get("scores"):
-                detail = f"scores {g.get('scores')} — {detail}"
-            lines.append(f"- **{gate['name'].replace('_', ' ').title()}:** {detail}")
-    for i in (1, 2):
-        cp = read_json(f"correctness_pass{i}.json")
-        if cp:
-            verdicts = ", ".join(f"{c.get('id')}: {c.get('verdict')}" for c in cp.get("claims", []))
-            lines.append(f"- **Correctness pass {i}:** {verdicts}")
-    lean_bits = []
-    for c in claims:
-        f = c.get("formalization")
-        if f:
-            lean_bits.append(f"{c.get('id')}: {f}" + (" ✓✓" if f == "proof-formalized" else ""))
-    if lean_bits:
-        lines.append(f"- **Lean track (Aristotle, non-gating):** {', '.join(lean_bits)} — Lean sources under `lean/`")
-    lines.append("")
-    caveat = "Verification caveat: apart from the self-check's computational counterexample search, all gates are LLM refereeing — treat as \"survived independent refereeing\", not as certainty."
-    if any(c.get("formalization") == "proof-formalized" for c in claims):
-        caveat += " Exception: claims marked ✓✓ carry a machine-checked Lean proof from the Aristotle track."
+    if form:
+        label = {
+            "proof-formalized": "**proof-formalized** ✓✓ — machine-checked Lean proof, no `sorry`",
+            "statement-formalized": "statement-formalized — Lean statement(s) built, proof incomplete",
+            "not-formalizable": "not-formalizable",
+        }.get(form.get("status"), str(form.get("status")))
+        extra = ""
+        if form.get("sorries"):
+            extra += f"; {form['sorries']} `sorry`(s) remain"
+        if form.get("error_reported"):
+            extra += "; see `lean/ERROR.md`"
+        lines.append(f"## Lean (Aristotle, non-gating)\n\n{label}{extra}. Lean sources under `lean/solution/`.")
+        lines.append("")
+
+    caveat = ("Verification caveat: the crosscheck is a single independent model refereeing GPT's note — "
+              "treat as \"survived independent cross-model refereeing\", not as certainty.")
+    if form and form.get("status") == "proof-formalized":
+        caveat += " Exception: Aristotle produced a machine-checked Lean proof (no `sorry`) of the note's results."
     lines.append(caveat)
     lines.append("")
     (dest / "SUMMARY.md").write_text("\n".join(lines))
@@ -1230,18 +946,138 @@ def finalize(run_dir, state, cfg=None):
     shutil.copytree(run_dir, dest)
     # strip in-flight machinery from the finalized copy
     (dest / ".lock").unlink(missing_ok=True)
-    for view in dest.glob("*_view"):  # isolated referee views (novelty_view, correctness_view, <gate>_view)
+    for view in dest.glob("*_view"):  # isolated referee views (crosscheck_view)
         shutil.rmtree(view, ignore_errors=True)
     if state["stage"] == "archive":
         reason = state.get("rejection_reason", "unknown")
-        (dest / "rejection.md").write_text(f"# Rejected: {slug}\n\n{reason}\n")
+        (dest / "rejection.md").write_text(
+            f"# Not recommended: {slug}\n\n{reason}\n\n"
+            "---\nIf this is a fixable correctness gap, the detail above is the feedback to hand back to GPT for a revision.\n")
     else:
-        write_review_summary(dest, state, cfg)
+        write_review_summary(dest, state)
         if cfg is None or cfg.get("notify", True):
-            notify_user("paper-starter", f"{slug} passed all gates — ready for review")
+            notify_user("paper-starter", f"{slug} passed crosscheck — ready for review")
     shutil.rmtree(run_dir)  # runs/ holds in-flight work only
     print(f"[finalize] {slug} -> {dest_root}/ (LLM cost ${state.get('cost_usd', 0.0):.2f})")
 
+
+# --- rank: the reading list ------------------------------------------------
+# Reading is the bottleneck, so after runs finish, Claude ranks everything that
+# passed crosscheck into PRIORITY.md — strongest/most-verified first, with a
+# one-line reason and risk per note. Deterministic fallback if the call fails,
+# so PRIORITY.md is always produced.
+
+def note_title(note_path):
+    try:
+        m = re.search(r"\\title(?:\[[^\]]*\])?\{(.+?)\}", note_path.read_text(), re.DOTALL)
+    except OSError:
+        return None
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else None
+
+
+def collect_reviewed():
+    """Compact factual digest of every run in review/, for ranking."""
+    base = ROOT / "review"
+    entries = []
+    for run in sorted(p for p in base.iterdir() if p.is_dir()) if base.exists() else []:
+        try:
+            state = json.loads((run / "state.json").read_text())
+            result = json.loads((run / "result.json").read_text())
+            claims = result["claims"]
+        except (OSError, json.JSONDecodeError, KeyError):
+            continue
+        try:
+            verdict = json.loads((run / "referee" / "crosscheck.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            verdict = {}
+        novelty = {c.get("id"): c for c in verdict.get("novelty", []) if isinstance(c, dict)}
+        entries.append({
+            "slug": run.name,
+            "paper": state.get("paper", "unknown"),
+            "title": note_title(run / "note.tex") or run.name,
+            "scores": verdict.get("scores", {}),
+            "taste_notes": verdict.get("notes", ""),
+            "formalization": result.get("formalization"),  # note-level Lean outcome
+            "claims": [
+                {
+                    "id": c.get("id"), "label": c.get("label"), "statement": c.get("statement"),
+                    "novelty": novelty.get(c.get("id"), {}).get("novelty_status"),
+                }
+                for c in claims
+            ],
+        })
+    return entries
+
+
+def collect_rejected():
+    base = ROOT / "archive"
+    out = []
+    for run in sorted(p for p in base.iterdir() if p.is_dir()) if base.exists() else []:
+        try:
+            state = json.loads((run / "state.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        reason = (state.get("rejection_reason", "") or "").splitlines()
+        out.append((run.name, reason[0] if reason else "archived"))
+    return out
+
+
+def rank_fallback_key(entry):
+    """Deterministic ordering when the ranker call is unavailable: Lean-proved
+    first, then taste depth/strength, then how many claims survived as novel. A
+    flagged proof error sinks the note (negative), since it needs checking."""
+    scores = entry.get("scores", {})
+    form = entry.get("formalization") or {}
+    proved = 1 if form.get("status") == "proof-formalized" else 0
+    flagged = -1 if form.get("error_reported") else 0
+    novel = sum(1 for c in entry["claims"] if c.get("novelty") == "novel")
+    return (flagged, proved, scores.get("depth", 0), scores.get("strength", 0), novel)
+
+
+def write_priority_fallback(entries, rejected):
+    lines = ["# Reading priority\n", "_Mechanically ordered (ranker unavailable): Lean-proved, then depth, then novelty; flagged errors last._\n"]
+    for i, e in enumerate(sorted(entries, key=rank_fallback_key, reverse=True), 1):
+        s = e.get("scores", {})
+        form = e.get("formalization") or {}
+        tag = ""
+        if form.get("status") == "proof-formalized":
+            tag = " — Lean-proved ✓✓"
+        if form.get("error_reported"):
+            tag += " — ⚠️ Aristotle flagged a proof error (see lean/ERROR.md)"
+        lines.append(f"{i}. **{e['title']}** (`{e['slug']}`, {e['paper']}) — scores {s or 'n/a'}{tag}")
+    if rejected:
+        lines.append("\n## Not recommended\n")
+        for slug, reason in rejected:
+            lines.append(f"- `{slug}` — {reason}")
+    (ROOT / "PRIORITY.md").write_text("\n".join(lines) + "\n")
+
+
+def do_rank(cfg):
+    entries = collect_reviewed()
+    rejected = collect_rejected()
+    if not entries:
+        print("[rank] nothing in review/ to rank yet")
+        return
+    work = ROOT / ".rank"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir()
+    (work / "digest.json").write_text(json.dumps({"passed": entries, "rejected": [
+        {"slug": s, "reason": r} for s, r in rejected]}, indent=2))
+    prompt = (ROOT / "prompts" / "rank.md").read_text()
+
+    ok, log = run_claude(work, prompt, cfg["referee_model"], "Read Write", cfg)
+    produced = work / "PRIORITY.md"
+    if ok and produced.exists():
+        shutil.move(str(produced), str(ROOT / "PRIORITY.md"))
+        print(f"[rank] wrote PRIORITY.md ({len(entries)} note(s) ranked)")
+    else:
+        write_priority_fallback(entries, rejected)
+        print(f"[rank] ranker call failed; wrote mechanical PRIORITY.md ({len(entries)} note(s))")
+    shutil.rmtree(work, ignore_errors=True)
+
+
+# --- dispatch --------------------------------------------------------------
 
 def advance(run_dir, cfg):
     state = load_state(run_dir)
@@ -1250,11 +1086,10 @@ def advance(run_dir, cfg):
         return False
     # Budget parking: checked BEFORE launching the next stage, so no money is
     # wasted on a call that would be cut off mid-flight. A parked run keeps all
-    # completed-stage progress; raising max_usd_per_paper (or refilling the
-    # account and raising the cap) resumes it exactly where it stopped.
-    # The lean stage is exempt from parking: Aristotle costs no LLM dollars,
-    # and parking a run that already passed both gates on its free bonus stage
-    # would only delay the review handoff.
+    # completed-stage progress; raising max_usd_per_paper resumes it where it
+    # stopped. The lean stage is exempt: Aristotle costs no LLM dollars, and
+    # parking a run that already passed crosscheck on its free bonus stage would
+    # only delay the review handoff.
     cap = cfg.get("max_usd_per_paper", 0)
     spent = state.get("cost_usd", 0.0)
     if cap and spent >= cap and stage != "lean":
@@ -1268,19 +1103,10 @@ def advance(run_dir, cfg):
         state["budget_parked"] = False
         append_history(state, stage, "budget cap satisfied again; resuming")
         save_state(run_dir, state)
-    if stage == "explore":
-        return do_explore(run_dir, state, cfg)
-    if stage == "self_check":
-        return do_self_check(run_dir, state, cfg)
-    if stage == "novelty":
-        return do_novelty(run_dir, state, cfg)
-    if stage == "correctness":
-        return do_correctness(run_dir, state, cfg)
+    if stage == "crosscheck":
+        return do_crosscheck(run_dir, state, cfg)
     if stage == "lean":
         return do_lean(run_dir, state, cfg)
-    for gate in gate_specs(cfg):
-        if stage == gate["name"]:
-            return do_gate(run_dir, state, cfg, gate)
     raise ValueError(f"unknown stage {stage!r} in {run_dir}")
 
 
@@ -1324,7 +1150,7 @@ def list_run_dirs():
 def print_status():
     """A quick human-readable snapshot of every run and where it sits. Read-only:
     never advances anything, so it is always safe to call (`orchestrate.py --status`)."""
-    for root, header in (("runs", "IN FLIGHT"), ("review", "REVIEW (passed all gates)"), ("archive", "ARCHIVED")):
+    for root, header in (("runs", "IN FLIGHT"), ("review", "REVIEW (passed crosscheck)"), ("archive", "NOT RECOMMENDED")):
         base = ROOT / root
         dirs = sorted(p for p in base.iterdir() if p.is_dir()) if base.exists() else []
         print(f"\n{header} — {len(dirs)}")
@@ -1350,21 +1176,23 @@ def preflight():
     if missing:
         raise SystemExit(f"missing required tool(s) on PATH: {', '.join(missing)} — see README.md for setup")
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[preflight] warning: ANTHROPIC_API_KEY is not set — claude -p will bill your "
-              "Claude subscription and share its session limit with your interactive usage; "
+        print("[preflight] ANTHROPIC_API_KEY not set — claude -p will bill your Claude "
+              "subscription and share its session limit with your interactive usage; "
               "a 429 mid-pipeline pauses runs until the window resets (see README.md)")
-    for d in ("inbox", "runs", "review", "archive", "taste/accepted", "taste/rejected"):
+    for d in ("inbox", "runs", "review", "archive"):
         (ROOT / d).mkdir(parents=True, exist_ok=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--drain", action="store_true",
-                         help="keep advancing every run until all are terminal (review/archive)")
+                         help="keep advancing every run until all are terminal (review/archive), then rank")
     parser.add_argument("--only", metavar="SLUG",
                          help="advance only runs/<SLUG>, ignoring all other pending runs")
     parser.add_argument("--status", action="store_true",
                          help="print where every run stands and exit (advances nothing)")
+    parser.add_argument("--rank", action="store_true",
+                         help="(re)generate PRIORITY.md from review/ and exit (advances nothing)")
     args = parser.parse_args()
 
     if args.status:
@@ -1374,11 +1202,16 @@ def main():
     load_dotenv()  # before preflight: its ANTHROPIC_API_KEY warning must see .env keys
     preflight()
     cfg = load_config()
-    validate_gate_config(cfg)
+
+    if args.rank:
+        do_rank(cfg)
+        return
+
     if cfg.get("lean_enabled", True) and not lean_enabled(cfg):
         print("[main] lean track unavailable (needs aristotle CLI on PATH + ARISTOTLE_API_KEY); runs will skip formalization")
     intake(cfg)
 
+    reached_review = False
     max_sweeps = 50 if args.drain else 1
     for _ in range(max_sweeps):
         progressed = False
@@ -1401,10 +1234,17 @@ def main():
                     print(f"[main] advancing {run_dir.name} (stage={state['stage']})")
                     changed = advance(run_dir, cfg)
                     progressed = progressed or changed
+                    if not (ROOT / "runs" / run_dir.name).exists():
+                        reached_review = reached_review or (ROOT / "review" / run_dir.name).exists()
             except Exception as e:
                 print(f"[main] ERROR advancing {run_dir.name}: {e}")
         if not args.drain or not progressed:
             break
+
+    # After a --drain, refresh the reading list once if anything new landed in
+    # review/. (A single-step run doesn't auto-rank — use --rank to refresh.)
+    if args.drain and reached_review:
+        do_rank(cfg)
 
 
 if __name__ == "__main__":
